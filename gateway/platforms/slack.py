@@ -1662,16 +1662,27 @@ class SlackAdapter(BasePlatformAdapter):
     _BLOCK_MAX_CONTEXT_TEXT = 1800  # context element text limit is 2000
     _BLOCK_MAX_COUNT = 48           # API allows 50; leave a 2-block safety margin
 
+    # Markdown table pattern: one-or-more header rows, one separator row,
+    # zero-or-more data rows.  Used both in _build_slack_blocks (to segment
+    # tables as first-class entities) and as a trigger condition.
+    _MD_TABLE_RE = re.compile(
+        r"(?:^[ \t]*\|[^\n]+\|[ \t]*\n)+"   # header row(s)
+        r"(?:^[ \t]*\|[-:| \t]+\|[ \t]*\n)"  # separator row
+        r"(?:^[ \t]*\|[^\n]+\|[ \t]*\n?)*",  # data rows (last may lack \n)
+        re.MULTILINE,
+    )
+
     def _build_slack_blocks(self, content: str) -> Optional[list]:
         """Convert markdown content into Slack Block Kit blocks for richer rendering.
 
-        Only activates when the content contains at least one markdown header
-        (``# Title`` / ``## Section``).  Plain prose and short replies keep using
-        the plain mrkdwn ``text`` field so they don't gain unwanted whitespace.
+        Activates when the content contains at least one markdown header
+        (``# Title`` / ``## Section``) **or** a markdown table.  Plain prose
+        and short replies keep using the plain mrkdwn ``text`` field.
 
         Block layout rules:
         - H1/H2 headers → Slack ``header`` block (plain_text, max 140 chars)
         - H3-H6 headers → ``section`` block with *bold* text
+        - Markdown tables → native Slack ``table`` block
         - Fenced code blocks → protected ``section`` block (mrkdwn)
         - Body text paragraphs → ``section`` blocks, chunked at 2900 chars
         - ``divider`` inserted between top-level sections (H1/H2 boundaries)
@@ -1682,17 +1693,19 @@ class SlackAdapter(BasePlatformAdapter):
         if not content:
             return None
 
-        # Only bother if there's at least one markdown header
-        if not re.search(r"^#{1,6}\s+\S", content, re.MULTILINE):
+        # Only bother if there's a markdown header or a table
+        has_header = bool(re.search(r"^#{1,6}\s+\S", content, re.MULTILINE))
+        has_table = bool(self._MD_TABLE_RE.search(content))
+        if not has_header and not has_table:
             return None
 
         # ── Step 1: tokenise the content into typed segments ──────────────────
-        # We interleave protected fenced code blocks with free-text lines so
-        # that later regex passes never corrupt triple-backtick contents.
+        # Extraction order: code fences → markdown tables → headers → body text.
+        # Each layer protects its delimiters so later passes never corrupt them.
         CODE_FENCE_RE = re.compile(r"(```(?:[^\n]*\n)?[\s\S]*?```)", re.MULTILINE)
         HEADER_RE = re.compile(r"^(#{1,6})\s+(.+)$")
 
-        segments: list[dict] = []  # {"kind": "header"|"code"|"text", ...}
+        segments: list[dict] = []  # {"kind": "header"|"code"|"table"|"text", ...}
 
         # Split on fenced code blocks first
         raw_parts = CODE_FENCE_RE.split(content)
@@ -1701,27 +1714,37 @@ class SlackAdapter(BasePlatformAdapter):
                 segments.append({"kind": "code", "text": raw_part})
                 continue
 
-            # Within non-code text, split on header lines
-            lines = raw_part.split("\n")
-            buffer: list[str] = []
+            # Within non-code text, split on markdown tables
+            table_non_matches = self._MD_TABLE_RE.split(raw_part)
+            table_matches = list(self._MD_TABLE_RE.finditer(raw_part))
 
-            def _flush_buffer() -> None:
-                chunk = "\n".join(buffer).strip()
-                if chunk:
-                    segments.append({"kind": "text", "text": chunk})
-                buffer.clear()
+            for i, sub_part in enumerate(table_non_matches):
+                # Process non-table text: split further on markdown header lines
+                if sub_part:
+                    lines = sub_part.split("\n")
+                    buf: list[str] = []
+                    for line in lines:
+                        m = HEADER_RE.match(line)
+                        if m:
+                            chunk = "\n".join(buf).strip()
+                            if chunk:
+                                segments.append({"kind": "text", "text": chunk})
+                            buf.clear()
+                            segments.append(
+                                {
+                                    "kind": "header",
+                                    "level": len(m.group(1)),
+                                    "text": m.group(2).strip(),
+                                }
+                            )
+                        else:
+                            buf.append(line)
+                    chunk = "\n".join(buf).strip()
+                    if chunk:
+                        segments.append({"kind": "text", "text": chunk})
 
-            for line in lines:
-                m = HEADER_RE.match(line)
-                if m:
-                    _flush_buffer()
-                    level = len(m.group(1))
-                    segments.append(
-                        {"kind": "header", "level": level, "text": m.group(2).strip()}
-                    )
-                else:
-                    buffer.append(line)
-            _flush_buffer()
+                if i < len(table_matches):
+                    segments.append({"kind": "table", "text": table_matches[i].group(0)})
 
         # ── Step 2: convert segments to blocks ────────────────────────────────
         blocks: list[dict] = []
@@ -1740,12 +1763,10 @@ class SlackAdapter(BasePlatformAdapter):
         def _add_text_segment(raw_text: str) -> None:
             """Apply mrkdwn conversion and chunk into section blocks."""
             formatted = self.format_message(raw_text)
-            # Chunk at _BLOCK_MAX_SECTION_TEXT, splitting on newlines where possible
             while formatted:
                 if len(formatted) <= self._BLOCK_MAX_SECTION_TEXT:
                     blocks.append(_section(formatted))
                     break
-                # Find a newline split point before the limit
                 split_at = formatted.rfind("\n", 0, self._BLOCK_MAX_SECTION_TEXT)
                 if split_at == -1:
                     split_at = self._BLOCK_MAX_SECTION_TEXT
@@ -1763,10 +1784,8 @@ class SlackAdapter(BasePlatformAdapter):
                 header_text = seg["text"].strip()
 
                 if level <= 2:
-                    # Top-level heading: add a divider before (except at the very start)
                     if prev_was_top_header or (blocks and blocks[-1].get("type") != "divider"):
                         _add_divider_if_needed()
-                    # Slack header blocks are plain_text only
                     plain_text = re.sub(r"[*_~`]", "", header_text)[: self._BLOCK_MAX_HEADER_TEXT]
                     blocks.append(
                         {
@@ -1776,29 +1795,35 @@ class SlackAdapter(BasePlatformAdapter):
                     )
                     prev_was_top_header = True
                 else:
-                    # Sub-heading: bold section block
                     bold_text = f"*{self.format_message(header_text)}*"
                     blocks.append(_section(bold_text))
                     prev_was_top_header = False
 
             elif kind == "code":
-                # Protect code block verbatim — no mrkdwn conversion inside
                 code_text = seg["text"]
                 if len(code_text) <= self._BLOCK_MAX_SECTION_TEXT:
                     blocks.append(_section(code_text))
                 else:
-                    # Truncate with indicator (rare for code in agent replies)
                     blocks.append(
                         _section(code_text[: self._BLOCK_MAX_SECTION_TEXT - 18] + "\n... [truncated]")
                     )
+                prev_was_top_header = False
+
+            elif kind == "table":
+                table_block = self._parse_markdown_table(seg["text"])
+                if table_block:
+                    blocks.append(table_block)
+                else:
+                    # Fallback: render as preformatted section
+                    _add_text_segment(f"```\n{seg['text'].strip()}\n```")
                 prev_was_top_header = False
 
             elif kind == "text":
                 _add_text_segment(seg["text"])
                 prev_was_top_header = False
 
-        # Require at least one header block to justify using blocks at all
-        if not any(b.get("type") == "header" for b in blocks):
+        # Require at least one structured block (header or table) to justify blocks
+        if not any(b.get("type") in ("header", "table") for b in blocks):
             return None
 
         # Strip leading/trailing dividers
@@ -1808,6 +1833,115 @@ class SlackAdapter(BasePlatformAdapter):
             blocks.pop()
 
         return blocks if blocks else None
+
+    @staticmethod
+    def _parse_markdown_table(table_text: str) -> Optional[dict]:
+        """Parse a markdown table string into a Slack native Table Block.
+
+        Slack Table Block spec:
+        - ``type: "table"``
+        - ``rows``: 2-D array of cells, max 100 rows × 20 columns
+        - each cell: ``{"type": "raw_text", "text": "..."}``
+        - ``column_settings``: optional alignment/wrap hints per column
+
+        The first row(s) before the ``|---|---| separator become the table
+        header rows (Slack renders the first row with header styling).
+        Inline markdown formatting is stripped from cell text because
+        ``raw_text`` cells don't support mrkdwn.
+
+        Returns ``None`` if the text cannot be parsed as a valid table.
+        """
+        lines = [ln for ln in table_text.strip().split("\n") if ln.strip()]
+        if len(lines) < 3:
+            return None
+
+        # Find the separator row (contains only |, -, :, spaces)
+        sep_idx = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            if (
+                stripped
+                and all(c in "|-: " for c in stripped)
+                and "|" in stripped
+                and "-" in stripped
+            ):
+                sep_idx = i
+                break
+
+        if sep_idx is None or sep_idx < 1:
+            return None
+
+        def _parse_row(line: str) -> list[str]:
+            line = line.strip()
+            if line.startswith("|"):
+                line = line[1:]
+            if line.endswith("|"):
+                line = line[:-1]
+            return [cell.strip() for cell in line.split("|")]
+
+        # Derive column alignment from the separator row
+        sep_cells = _parse_row(lines[sep_idx])
+        alignments: list[str] = []
+        for cell in sep_cells:
+            c = cell.strip()
+            if c.startswith(":") and c.endswith(":"):
+                alignments.append("center")
+            elif c.endswith(":"):
+                alignments.append("right")
+            else:
+                alignments.append("left")
+
+        header_rows = [_parse_row(lines[i]) for i in range(sep_idx)]
+        data_rows = [
+            _parse_row(lines[i])
+            for i in range(sep_idx + 1, len(lines))
+            if "|" in lines[i]
+        ]
+
+        if not header_rows or not data_rows:
+            return None
+
+        all_rows = header_rows + data_rows
+        # Slack caps: 100 rows, 20 columns
+        col_count = min(max(len(r) for r in all_rows), 20)
+        all_rows = all_rows[:100]
+
+        def _strip_md(text: str) -> str:
+            """Strip markdown formatting delimiters while preserving underscores in words."""
+            text = re.sub(r"\*\*\*(.+?)\*\*\*", r"\1", text)   # bold+italic
+            text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)        # bold
+            text = re.sub(r"(?<!\*)\*(\S(?:[^*\n]*?\S)?)\*(?!\*)", r"\1", text)  # *italic*
+            text = re.sub(r"(?<!\w)_(\S(?:[^_\n]*?\S)?)_(?!\w)", r"\1", text)   # _italic_
+            text = re.sub(r"~~(.+?)~~", r"\1", text)             # strikethrough
+            text = re.sub(r"`([^`]+)`", r"\1", text)             # inline code
+            return text
+
+        def _make_cell(text: str) -> dict:
+            clean = _strip_md(text).strip()
+            return {"type": "raw_text", "text": clean or " "}
+
+        def _pad_row(cells: list[str]) -> list[dict]:
+            row = [_make_cell(c) for c in cells[:col_count]]
+            while len(row) < col_count:
+                row.append(_make_cell(""))
+            return row
+
+        rows = [_pad_row(r) for r in all_rows]
+
+        # Pad alignments list to cover all columns
+        while len(alignments) < col_count:
+            alignments.append("left")
+
+        column_settings = [
+            {"align": alignments[i], "is_wrapped": True}
+            for i in range(col_count)
+        ]
+
+        return {
+            "type": "table",
+            "rows": rows,
+            "column_settings": column_settings,
+        }
 
     # ----- Reactions -----
 
