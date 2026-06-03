@@ -1081,9 +1081,6 @@ class SlackAdapter(BasePlatformAdapter):
             # Convert standard markdown → Slack mrkdwn
             formatted = self.format_message(content)
 
-            # Split long messages, preserving code block boundaries
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
-
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
 
@@ -1091,19 +1088,43 @@ class SlackAdapter(BasePlatformAdapter):
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
 
-            for i, chunk in enumerate(chunks):
-                kwargs = {
+            # Try Block Kit rendering when the message has markdown headers.
+            # This gives structured responses (numbered sections, H1/H2 headings)
+            # visual hierarchy in Slack.  Falls back silently to plain mrkdwn if
+            # the content is too simple, too long, or block construction fails.
+            use_blocks = self.config.extra.get("use_blocks", True)
+            slack_blocks = self._build_slack_blocks(content) if use_blocks else None
+
+            if slack_blocks:
+                # Notification-only fallback text (shown in push notifications /
+                # accessibility tools that can't render blocks).
+                fallback_text = content[:150].strip()
+                if len(content) > 150:
+                    fallback_text += "…"
+                kwargs: Dict[str, Any] = {
                     "channel": chat_id,
-                    "text": chunk,
-                    "mrkdwn": True,
+                    "text": fallback_text,
+                    "blocks": slack_blocks,
                 }
                 if thread_ts:
                     kwargs["thread_ts"] = thread_ts
-                    # Only broadcast the first chunk of the first reply
-                    if broadcast and i == 0:
+                    if broadcast:
                         kwargs["reply_broadcast"] = True
-
                 last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
+            else:
+                # Plain mrkdwn path — split long messages preserving code boundaries
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+                for i, chunk in enumerate(chunks):
+                    kwargs = {
+                        "channel": chat_id,
+                        "text": chunk,
+                        "mrkdwn": True,
+                    }
+                    if thread_ts:
+                        kwargs["thread_ts"] = thread_ts
+                        if broadcast and i == 0:
+                            kwargs["reply_broadcast"] = True
+                    last_result = await self._get_client(chat_id).chat_postMessage(**kwargs)
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -1605,11 +1626,188 @@ class SlackAdapter(BasePlatformAdapter):
 
         # 12) Blockquotes: > prefix is already protected by step 5 above.
 
+        # 12a) Convert horizontal rules (--- / *** / ___ on their own line) to a
+        #      Unicode line character so they render visually in Slack.
+        text = re.sub(
+            r"^(?:-{3,}|\*{3,}|_{3,})\s*$",
+            "────────────────────────────────────",
+            text,
+            flags=re.MULTILINE,
+        )
+
+        # 12b) Detect Markdown tables (rows of | … | on consecutive lines) and
+        #      wrap them in a fenced code block so alignment is preserved in the
+        #      Slack monospace font.  The separator row (|---|---|) marks a table.
+        def _wrap_table(m: re.Match) -> str:
+            table_text = m.group(0).rstrip()
+            return _ph(f"```\n{table_text}\n```")
+
+        text = re.sub(
+            r"(?m)(?:^[ \t]*\|[^\n]+\|\s*\n)+(?:^[ \t]*\|[-:| \t]+\|\s*\n)(?:^[ \t]*\|[^\n]+\|\s*\n)*",
+            _wrap_table,
+            text,
+        )
+
         # 13) Restore placeholders in reverse order
         for key in reversed(placeholders):
             text = text.replace(key, placeholders[key])
 
         return text
+
+    # ----- Block Kit message builder -----
+
+    # Slack API hard limits
+    _BLOCK_MAX_SECTION_TEXT = 2900  # section.text.text limit is 3000; stay conservative
+    _BLOCK_MAX_HEADER_TEXT = 140    # header.text.text limit is 150
+    _BLOCK_MAX_CONTEXT_TEXT = 1800  # context element text limit is 2000
+    _BLOCK_MAX_COUNT = 48           # API allows 50; leave a 2-block safety margin
+
+    def _build_slack_blocks(self, content: str) -> Optional[list]:
+        """Convert markdown content into Slack Block Kit blocks for richer rendering.
+
+        Only activates when the content contains at least one markdown header
+        (``# Title`` / ``## Section``).  Plain prose and short replies keep using
+        the plain mrkdwn ``text`` field so they don't gain unwanted whitespace.
+
+        Block layout rules:
+        - H1/H2 headers → Slack ``header`` block (plain_text, max 140 chars)
+        - H3-H6 headers → ``section`` block with *bold* text
+        - Fenced code blocks → protected ``section`` block (mrkdwn)
+        - Body text paragraphs → ``section`` blocks, chunked at 2900 chars
+        - ``divider`` inserted between top-level sections (H1/H2 boundaries)
+        - Falls back to ``None`` if >48 blocks would be generated
+
+        Returns ``None`` to signal the caller should fall back to plain text.
+        """
+        if not content:
+            return None
+
+        # Only bother if there's at least one markdown header
+        if not re.search(r"^#{1,6}\s+\S", content, re.MULTILINE):
+            return None
+
+        # ── Step 1: tokenise the content into typed segments ──────────────────
+        # We interleave protected fenced code blocks with free-text lines so
+        # that later regex passes never corrupt triple-backtick contents.
+        CODE_FENCE_RE = re.compile(r"(```(?:[^\n]*\n)?[\s\S]*?```)", re.MULTILINE)
+        HEADER_RE = re.compile(r"^(#{1,6})\s+(.+)$")
+
+        segments: list[dict] = []  # {"kind": "header"|"code"|"text", ...}
+
+        # Split on fenced code blocks first
+        raw_parts = CODE_FENCE_RE.split(content)
+        for raw_part in raw_parts:
+            if CODE_FENCE_RE.match(raw_part):
+                segments.append({"kind": "code", "text": raw_part})
+                continue
+
+            # Within non-code text, split on header lines
+            lines = raw_part.split("\n")
+            buffer: list[str] = []
+
+            def _flush_buffer() -> None:
+                chunk = "\n".join(buffer).strip()
+                if chunk:
+                    segments.append({"kind": "text", "text": chunk})
+                buffer.clear()
+
+            for line in lines:
+                m = HEADER_RE.match(line)
+                if m:
+                    _flush_buffer()
+                    level = len(m.group(1))
+                    segments.append(
+                        {"kind": "header", "level": level, "text": m.group(2).strip()}
+                    )
+                else:
+                    buffer.append(line)
+            _flush_buffer()
+
+        # ── Step 2: convert segments to blocks ────────────────────────────────
+        blocks: list[dict] = []
+        prev_was_top_header = False
+
+        def _add_divider_if_needed() -> None:
+            if blocks and blocks[-1].get("type") != "divider":
+                blocks.append({"type": "divider"})
+
+        def _section(mrkdwn_text: str) -> dict:
+            return {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": mrkdwn_text},
+            }
+
+        def _add_text_segment(raw_text: str) -> None:
+            """Apply mrkdwn conversion and chunk into section blocks."""
+            formatted = self.format_message(raw_text)
+            # Chunk at _BLOCK_MAX_SECTION_TEXT, splitting on newlines where possible
+            while formatted:
+                if len(formatted) <= self._BLOCK_MAX_SECTION_TEXT:
+                    blocks.append(_section(formatted))
+                    break
+                # Find a newline split point before the limit
+                split_at = formatted.rfind("\n", 0, self._BLOCK_MAX_SECTION_TEXT)
+                if split_at == -1:
+                    split_at = self._BLOCK_MAX_SECTION_TEXT
+                blocks.append(_section(formatted[:split_at]))
+                formatted = formatted[split_at:].lstrip("\n")
+
+        for seg in segments:
+            if len(blocks) >= self._BLOCK_MAX_COUNT:
+                return None  # Too many blocks — fall back to plain text
+
+            kind = seg["kind"]
+
+            if kind == "header":
+                level = seg["level"]
+                header_text = seg["text"].strip()
+
+                if level <= 2:
+                    # Top-level heading: add a divider before (except at the very start)
+                    if prev_was_top_header or (blocks and blocks[-1].get("type") != "divider"):
+                        _add_divider_if_needed()
+                    # Slack header blocks are plain_text only
+                    plain_text = re.sub(r"[*_~`]", "", header_text)[: self._BLOCK_MAX_HEADER_TEXT]
+                    blocks.append(
+                        {
+                            "type": "header",
+                            "text": {"type": "plain_text", "text": plain_text, "emoji": True},
+                        }
+                    )
+                    prev_was_top_header = True
+                else:
+                    # Sub-heading: bold section block
+                    bold_text = f"*{self.format_message(header_text)}*"
+                    blocks.append(_section(bold_text))
+                    prev_was_top_header = False
+
+            elif kind == "code":
+                # Protect code block verbatim — no mrkdwn conversion inside
+                code_text = seg["text"]
+                if len(code_text) <= self._BLOCK_MAX_SECTION_TEXT:
+                    blocks.append(_section(code_text))
+                else:
+                    # Truncate with indicator (rare for code in agent replies)
+                    blocks.append(
+                        _section(code_text[: self._BLOCK_MAX_SECTION_TEXT - 18] + "\n... [truncated]")
+                    )
+                prev_was_top_header = False
+
+            elif kind == "text":
+                _add_text_segment(seg["text"])
+                prev_was_top_header = False
+
+        # Require at least one header block to justify using blocks at all
+        if not any(b.get("type") == "header" for b in blocks):
+            return None
+
+        # Strip leading/trailing dividers
+        while blocks and blocks[0].get("type") == "divider":
+            blocks.pop(0)
+        while blocks and blocks[-1].get("type") == "divider":
+            blocks.pop()
+
+        return blocks if blocks else None
 
     # ----- Reactions -----
 
@@ -2662,44 +2860,60 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             cmd_preview = command[:2900] + "..." if len(command) > 2900 else command
             thread_ts = self._resolve_thread_ts(None, metadata)
+            reason_text = f":speech_balloon: *Reason:* {description}" if description else ""
 
             blocks = [
+                {
+                    "type": "header",
+                    "text": {
+                        "type": "plain_text",
+                        "text": "⚠️ Command Approval Required",
+                        "emoji": True,
+                    },
+                },
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": (
-                            f":warning: *Command Approval Required*\n"
-                            f"```{cmd_preview}```\n"
-                            f"Reason: {description}"
-                        ),
+                        "text": f"```{cmd_preview}```",
                     },
                 },
+                *(
+                    [
+                        {
+                            "type": "context",
+                            "elements": [{"type": "mrkdwn", "text": reason_text}],
+                        }
+                    ]
+                    if reason_text
+                    else []
+                ),
+                {"type": "divider"},
                 {
                     "type": "actions",
                     "elements": [
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Allow Once"},
+                            "text": {"type": "plain_text", "text": "Allow Once", "emoji": True},
                             "style": "primary",
                             "action_id": "hermes_approve_once",
                             "value": session_key,
                         },
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Allow Session"},
+                            "text": {"type": "plain_text", "text": "Allow Session", "emoji": True},
                             "action_id": "hermes_approve_session",
                             "value": session_key,
                         },
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Always Allow"},
+                            "text": {"type": "plain_text", "text": "Always Allow", "emoji": True},
                             "action_id": "hermes_approve_always",
                             "value": session_key,
                         },
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Deny"},
+                            "text": {"type": "plain_text", "text": "Deny", "emoji": True},
                             "style": "danger",
                             "action_id": "hermes_deny",
                             "value": session_key,
@@ -2745,34 +2959,37 @@ class SlackAdapter(BasePlatformAdapter):
             # Encode session_key and confirm_id into the button value so the
             # callback handler can resolve without extra bookkeeping.
             value = f"{session_key}|{confirm_id}"
+            header_text = (title or "Confirm")[:self._BLOCK_MAX_HEADER_TEXT]
 
             blocks = [
                 {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": f"*{title or 'Confirm'}*\n\n{body}",
-                    },
+                    "type": "header",
+                    "text": {"type": "plain_text", "text": header_text, "emoji": True},
                 },
+                {
+                    "type": "section",
+                    "text": {"type": "mrkdwn", "text": body},
+                },
+                {"type": "divider"},
                 {
                     "type": "actions",
                     "elements": [
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Approve Once"},
+                            "text": {"type": "plain_text", "text": "Approve Once", "emoji": True},
                             "style": "primary",
                             "action_id": "hermes_confirm_once",
                             "value": value,
                         },
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Always Approve"},
+                            "text": {"type": "plain_text", "text": "Always Approve", "emoji": True},
                             "action_id": "hermes_confirm_always",
                             "value": value,
                         },
                         {
                             "type": "button",
-                            "text": {"type": "plain_text", "text": "Cancel"},
+                            "text": {"type": "plain_text", "text": "Cancel", "emoji": True},
                             "style": "danger",
                             "action_id": "hermes_confirm_cancel",
                             "value": value,

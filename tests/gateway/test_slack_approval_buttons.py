@@ -85,12 +85,19 @@ class TestSlackExecApproval:
         kwargs = mock_client.chat_postMessage.call_args[1]
         assert "blocks" in kwargs
         blocks = kwargs["blocks"]
-        assert len(blocks) == 2
-        assert blocks[0]["type"] == "section"
-        assert "rm -rf /important" in blocks[0]["text"]["text"]
-        assert "dangerous deletion" in blocks[0]["text"]["text"]
-        assert blocks[1]["type"] == "actions"
-        elements = blocks[1]["elements"]
+        block_types = [b["type"] for b in blocks]
+        # New layout: header, section (command), context (reason), divider, actions
+        assert blocks[0]["type"] == "header"
+        assert "Approval" in blocks[0]["text"]["text"]
+        # Command preview is in the section block
+        cmd_section = next(b for b in blocks if b["type"] == "section")
+        assert "rm -rf /important" in cmd_section["text"]["text"]
+        # Reason is in a context block
+        ctx_block = next(b for b in blocks if b["type"] == "context")
+        assert "dangerous deletion" in ctx_block["elements"][0]["text"]
+        # Actions block with 4 buttons
+        actions_block = next(b for b in blocks if b["type"] == "actions")
+        elements = actions_block["elements"]
         assert len(elements) == 4
         action_ids = [e["action_id"] for e in elements]
         assert "hermes_approve_once" in action_ids
@@ -138,7 +145,9 @@ class TestSlackExecApproval:
         )
 
         kwargs = mock_client.chat_postMessage.call_args[1]
-        section_text = kwargs["blocks"][0]["text"]["text"]
+        # blocks[0] is the header; blocks[1] is the section with the command preview
+        cmd_section = next(b for b in kwargs["blocks"] if b["type"] == "section")
+        section_text = cmd_section["text"]["text"]
         assert "..." in section_text
         assert len(section_text) < 5000
 
