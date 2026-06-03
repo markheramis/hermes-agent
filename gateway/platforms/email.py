@@ -485,6 +485,7 @@ class EmailAdapter(BasePlatformAdapter):
             chat_type="dm",
             user_id=sender_addr,
             user_name=msg_data["sender_name"] or sender_addr,
+            user_email=sender_addr,  # sender's address IS the email
         )
 
         event = MessageEvent(

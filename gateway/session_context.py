@@ -37,7 +37,7 @@ needs to replace the import + call site:
 """
 
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Dict, Optional
 
 # Sentinel to distinguish "never set in this context" from "explicitly set to empty".
 # When a contextvar holds _UNSET, we fall back to os.environ (CLI/cron compat).
@@ -54,6 +54,8 @@ _SESSION_CHAT_NAME: ContextVar = ContextVar("HERMES_SESSION_CHAT_NAME", default=
 _SESSION_THREAD_ID: ContextVar = ContextVar("HERMES_SESSION_THREAD_ID", default=_UNSET)
 _SESSION_USER_ID: ContextVar = ContextVar("HERMES_SESSION_USER_ID", default=_UNSET)
 _SESSION_USER_NAME: ContextVar = ContextVar("HERMES_SESSION_USER_NAME", default=_UNSET)
+_SESSION_USER_EMAIL: ContextVar = ContextVar("HERMES_SESSION_USER_EMAIL", default=_UNSET)
+_SESSION_PARTICIPANTS: ContextVar = ContextVar("HERMES_SESSION_PARTICIPANTS", default=_UNSET)
 _SESSION_KEY: ContextVar = ContextVar("HERMES_SESSION_KEY", default=_UNSET)
 _SESSION_ID: ContextVar = ContextVar("HERMES_SESSION_ID", default=_UNSET)
 # ID of the message that triggered the current turn. Used as a reply anchor
@@ -74,6 +76,8 @@ _VAR_MAP = {
     "HERMES_SESSION_THREAD_ID": _SESSION_THREAD_ID,
     "HERMES_SESSION_USER_ID": _SESSION_USER_ID,
     "HERMES_SESSION_USER_NAME": _SESSION_USER_NAME,
+    "HERMES_SESSION_USER_EMAIL": _SESSION_USER_EMAIL,
+    "HERMES_SESSION_PARTICIPANTS": _SESSION_PARTICIPANTS,
     "HERMES_SESSION_KEY": _SESSION_KEY,
     "HERMES_SESSION_ID": _SESSION_ID,
     "HERMES_SESSION_MESSAGE_ID": _SESSION_MESSAGE_ID,
@@ -105,6 +109,8 @@ def set_session_vars(
     thread_id: str = "",
     user_id: str = "",
     user_name: str = "",
+    user_email: str = "",
+    participants: Optional[Dict[str, Dict[str, str]]] = None,
     session_key: str = "",
     message_id: str = "",
 ) -> list:
@@ -123,9 +129,12 @@ def set_session_vars(
         _SESSION_THREAD_ID.set(thread_id),
         _SESSION_USER_ID.set(user_id),
         _SESSION_USER_NAME.set(user_name),
+        _SESSION_USER_EMAIL.set(user_email),
+        _SESSION_PARTICIPANTS.set(participants or {}),
         _SESSION_KEY.set(session_key),
         _SESSION_MESSAGE_ID.set(message_id),
     ]
+
     return tokens
 
 

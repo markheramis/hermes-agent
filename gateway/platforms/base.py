@@ -16,6 +16,7 @@ import socket as _socket
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from abc import ABC, abstractmethod
 from urllib.parse import urlsplit
@@ -4588,7 +4589,35 @@ class BasePlatformAdapter(ABC):
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
         return self._pending_messages.pop(session_key, None)
-    
+
+    # Strips C0/C1 controls, zero-width chars (ZWSP/ZWNJ/ZWJ/LRM/RLM/BOM),
+    # and bidi overrides (LRE/RLE/PDF/LRO/RLO/LRI/RLI/FSI/PDI) — all known
+    # prompt-injection / display-spoofing vectors in user-controlled names.
+    _IDENTITY_STRIP_RE = re.compile(
+        r'[\x00-\x1f\x7f-\x9f'
+        r'​-‏'
+        r'﻿'
+        r'‪-‮'
+        r'⁦-⁩'
+        r']'
+    )
+
+    @staticmethod
+    def sanitize_identity(value: str, max_len: int = 80) -> str:
+        """Scrub a user-controlled identity string for prompt-safe use.
+
+        Strips control / zero-width / bidi-override chars, NFKC-normalizes
+        (so fullwidth ``ｕｓｅｒ`` collapses to ``user``), then clips to
+        ``max_len``. Script confusables (Cyrillic ``ѕ`` vs Latin ``s``)
+        are deliberately preserved — folding them would mangle legitimate
+        non-Latin names. Empty input returns ``""``.
+        """
+        if not value:
+            return ""
+        cleaned = BasePlatformAdapter._IDENTITY_STRIP_RE.sub('', str(value))
+        cleaned = unicodedata.normalize("NFKC", cleaned)
+        return cleaned[:max_len].strip()
+
     def build_source(
         self,
         chat_id: str,
@@ -4596,6 +4625,8 @@ class BasePlatformAdapter(ABC):
         chat_type: str = "dm",
         user_id: Optional[str] = None,
         user_name: Optional[str] = None,
+        user_email: Optional[str] = None,
+        participants: Optional[Dict[str, Dict[str, str]]] = None,
         thread_id: Optional[str] = None,
         chat_topic: Optional[str] = None,
         user_id_alt: Optional[str] = None,
@@ -4616,6 +4647,8 @@ class BasePlatformAdapter(ABC):
             chat_type=chat_type,
             user_id=str(user_id) if user_id else None,
             user_name=user_name,
+            user_email=user_email,
+            participants=participants,
             thread_id=str(thread_id) if thread_id else None,
             chat_topic=chat_topic.strip() if chat_topic else None,
             user_id_alt=user_id_alt,

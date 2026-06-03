@@ -1657,6 +1657,46 @@ import weakref as _weakref
 _gateway_runner_ref: _weakref.ref = lambda: None
 
 
+# Idempotency guard — tests can spin up multiple runners in one process.
+_PARTICIPANT_CLEANUP_LISTENER_REGISTERED = False
+
+
+def _register_participant_cleanup_listener(session_store) -> None:
+    """Wipe the participant roster whenever a session finalizes.
+
+    Backstop for the explicit clear calls in the expiry watcher and
+    reset_session — also covers the shutdown path and any future site
+    that fires on_session_finalize without an explicit clear.
+    """
+    global _PARTICIPANT_CLEANUP_LISTENER_REGISTERED
+    if _PARTICIPANT_CLEANUP_LISTENER_REGISTERED:
+        return
+    try:
+        from hermes_cli.plugins import get_plugin_manager
+    except Exception as exc:
+        logger.debug("participant cleanup listener: plugin manager unavailable (%s)", exc)
+        return
+
+    def _on_finalize(session_id: Optional[str] = None,
+                     platform: Optional[str] = None, **_) -> None:
+        if not session_id:
+            return
+        try:
+            cleared = session_store.clear_participants_for_session(session_id)
+            if cleared:
+                logger.debug("Finalize listener cleared %d participant(s) for %s",
+                             cleared, session_id)
+        except Exception as exc:
+            logger.debug("on_session_finalize listener raised: %s", exc)
+
+    try:
+        manager = get_plugin_manager()
+        manager._hooks.setdefault("on_session_finalize", []).append(_on_finalize)
+        _PARTICIPANT_CLEANUP_LISTENER_REGISTERED = True
+    except Exception as exc:
+        logger.debug("participant cleanup listener: registration failed (%s)", exc)
+
+
 def _normalize_empty_agent_response(
     agent_result: dict,
     response: str,
@@ -1806,6 +1846,8 @@ class GatewayRunner:
             self.config.sessions_dir, self.config,
             has_active_processes_fn=lambda key: process_registry.has_active_for_session(key),
         )
+
+        _register_participant_cleanup_listener(self.session_store)
         self.delivery_router = DeliveryRouter(self.config)
         self._running = False
         self._gateway_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -4985,6 +5027,16 @@ class GatewayRunner:
                             )
                         except Exception:
                             pass
+                        # Wipe roster even if the hook above swallowed an error.
+                        try:
+                            _cleared = self.session_store.clear_participants_for_session(entry.session_id)
+                            if _cleared:
+                                logger.debug(
+                                    "Session expiry: cleared %d participant(s) for %s",
+                                    _cleared, entry.session_id,
+                                )
+                        except Exception as _exc:
+                            logger.debug("clear_participants_for_session raised during expiry: %s", _exc)
                         # Shut down memory provider and close tool resources
                         # on the cached agent.  Idle agents live in
                         # _agent_cache (not _running_agents), so look there.
@@ -8407,7 +8459,11 @@ class GatewayRunner:
             thread_sessions_per_user=_thread_sessions_per_user,
         )
         if _is_shared_multi_user and source.user_name:
-            message_text = f"[{source.user_name}] {message_text}"
+            # Sanitize: strip control chars, limit to 80 chars (defense in depth
+            # even though the adapter already sanitizes on resolve).
+            _safe_name = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', str(source.user_name))[:80].strip()
+            if _safe_name:
+                message_text = f"[{_safe_name}] {message_text}"
 
         # Prepend channel context from history backfill (if any).  This
         # happens after sender-prefix so the prefix only applies to the
@@ -8678,6 +8734,19 @@ class GatewayRunner:
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
         self._cache_session_source(session_key, source)
+
+        # Track sender for the get_session_participants tool. Empty user_id
+        # (cron, home-channel ping) is a no-op inside the store method.
+        try:
+            self.session_store.upsert_participant(
+                session_key,
+                str(source.user_id) if source.user_id else "",
+                source.user_name or "",
+                source.user_email or "",
+            )
+        except Exception as _exc:
+            logger.debug("upsert_participant raised: %s", _exc)
+
         if self._is_telegram_topic_lane(source):
             try:
                 binding = self._session_db.get_telegram_topic_binding(
@@ -12452,6 +12521,9 @@ class GatewayRunner:
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
                     user_name=source.user_name,
+                    user_email=source.user_email,
+                    # Background tasks don't carry an interactive roster.
+                    participants=None,
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,
@@ -15341,6 +15413,18 @@ class GatewayRunner:
         in a ``finally`` block.
         """
         from gateway.session_context import set_session_vars
+
+        # Skip the snapshot for solo sessions — the system prompt hint
+        # and the get_session_participants tool both gate on count > 1.
+        _participants = None
+        try:
+            if self.session_store is not None:
+                _snapshot = self.session_store.snapshot_participants(context.session_key)
+                if len(_snapshot) > 1:
+                    _participants = _snapshot
+        except Exception as _exc:
+            logger.debug("snapshot_participants failed for _set_session_env: %s", _exc)
+
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -15348,6 +15432,8 @@ class GatewayRunner:
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
+            user_email=str(context.source.user_email) if context.source.user_email else "",
+            participants=_participants,
             session_key=context.session_key,
             message_id=str(context.source.message_id) if context.source.message_id else "",
         )
@@ -17579,6 +17665,11 @@ class GatewayRunner:
                     user_id=source.user_id,
                     user_id_alt=source.user_id_alt,
                     user_name=source.user_name,
+                    user_email=source.user_email,
+                    participants=(
+                        self.session_store.snapshot_participants(session_key) or None
+                        if self.session_store is not None else None
+                    ),
                     chat_id=source.chat_id,
                     chat_name=source.chat_name,
                     chat_type=source.chat_type,

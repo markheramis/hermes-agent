@@ -182,6 +182,8 @@ def init_agent(
     user_id: str = None,
     user_id_alt: str = None,
     user_name: str = None,
+    user_email: str = None,
+    participants: dict = None,
     chat_id: str = None,
     chat_name: str = None,
     chat_type: str = None,
@@ -265,6 +267,8 @@ def init_agent(
     agent._user_id = user_id  # Platform user identifier (gateway sessions)
     agent._user_id_alt = user_id_alt  # Optional stable alternate platform identifier
     agent._user_name = user_name
+    agent._user_email = user_email
+    agent._participants = participants or {}
     agent._chat_id = chat_id
     agent._chat_name = chat_name
     agent._chat_type = chat_type
@@ -1122,6 +1126,8 @@ def init_agent(
                         _init_kwargs["user_id_alt"] = agent._user_id_alt
                     if agent._user_name:
                         _init_kwargs["user_name"] = agent._user_name
+                    if agent._user_email:
+                        _init_kwargs["user_email"] = agent._user_email
                     if agent._chat_id:
                         _init_kwargs["chat_id"] = agent._chat_id
                     if agent._chat_name:

@@ -335,6 +335,26 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nModel: {agent.model}"
     if agent.provider:
         timestamp_line += f"\nProvider: {agent.provider}"
+    # Session user identity (gateway sessions only)
+    # Email is only shown when the platform adapter provides it (opt-in
+    # per platform).  Name is always shown when available.  Empty in
+    # direct CLI sessions.
+    _session_user_name = getattr(agent, "_user_name", None)
+    _session_user_email = getattr(agent, "_user_email", None)
+    if _session_user_name:
+        if _session_user_email:
+            timestamp_line += f"\nCurrent session: {_session_user_name} <{_session_user_email}>"
+        else:
+            timestamp_line += f"\nCurrent session: {_session_user_name}"
+    # Session participant count hint (multi-user sessions only)
+    _participants = getattr(agent, "_participants", None) or {}
+    _participant_count = len(_participants)
+    if _participant_count > 1:
+        timestamp_line += (
+            f"\nSession has {_participant_count} participants — "
+            f"call get_session_participants for names/emails if you "
+            f"need attribution."
+        )
     volatile_parts.append(timestamp_line)
 
     return {

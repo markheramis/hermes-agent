@@ -215,6 +215,14 @@ _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
 
+
+def _feishu_capture_user_email_enabled() -> bool:
+    """Opt-in flag for collecting sender email; mirrors SLACK_CAPTURE_USER_EMAIL."""
+    import os as _os
+    raw = _os.getenv("FEISHU_CAPTURE_USER_EMAIL", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
     "approve_session": "session",
@@ -1439,6 +1447,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
+        # Populated only when FEISHU_CAPTURE_USER_EMAIL is set; same TTL as names.
+        self._sender_email_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (email, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
         self._card_action_tokens: Dict[str, float] = {}  # token → first_seen_time
@@ -2758,6 +2768,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type_raw),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
+            user_email=sender_profile.get("user_email") or "",
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
         )
@@ -2820,6 +2831,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type="group"),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
+            user_email=sender_profile.get("user_email") or "",
             thread_id=None,
             user_id_alt=sender_profile["user_id_alt"],
         )
@@ -3094,6 +3106,7 @@ class FeishuAdapter(BasePlatformAdapter):
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
+            user_email=sender_profile.get("user_email") or "",
             thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
             is_bot=is_bot,
@@ -3842,6 +3855,8 @@ class FeishuAdapter(BasePlatformAdapter):
         all apps by the same developer).  Session-key generation prefers
         user_id_alt when present, so participant isolation stays stable even
         if the primary ID is the app-scoped open_id.
+
+        ``user_email`` is opt-in via FEISHU_CAPTURE_USER_EMAIL; ``None`` otherwise.
         """
         open_id = getattr(sender_id, "open_id", None) or None
         user_id = getattr(sender_id, "user_id", None) or None
@@ -3853,10 +3868,15 @@ class FeishuAdapter(BasePlatformAdapter):
         display_name = await self._resolve_sender_name_from_api(
             name_lookup_id, is_bot=is_bot,
         )
+        # Gate the read too — flipping the env var off must not surface cached PII.
+        user_email: Optional[str] = None
+        if _feishu_capture_user_email_enabled() and not is_bot and name_lookup_id:
+            user_email = self._get_cached_sender_email(name_lookup_id)
         return {
             "user_id": primary_id,
             "user_name": display_name,
             "user_id_alt": union_id,
+            "user_email": user_email,
         }
 
     def _get_cached_sender_name(self, sender_id: Optional[str]) -> Optional[str]:
@@ -3870,6 +3890,19 @@ class FeishuAdapter(BasePlatformAdapter):
         if time.time() < expire_at:
             return name
         self._sender_name_cache.pop(sender_id, None)
+        return None
+
+    def _get_cached_sender_email(self, sender_id: Optional[str]) -> Optional[str]:
+        """Cached email lookup; caller is responsible for the env-var gate."""
+        if not sender_id:
+            return None
+        cached = self._sender_email_cache.get(sender_id)
+        if cached is None:
+            return None
+        email, expire_at = cached
+        if time.time() < expire_at:
+            return email or None
+        self._sender_email_cache.pop(sender_id, None)
         return None
 
     async def _resolve_sender_name_from_api(
@@ -3922,6 +3955,18 @@ class FeishuAdapter(BasePlatformAdapter):
                 name = name.strip()
                 if name:
                     self._sender_name_cache[trimmed] = (name, now + _FEISHU_SENDER_NAME_TTL_SECONDS)
+                    # Piggyback email capture on the same API response so
+                    # we don't re-call contact later. Gated at write so the
+                    # cache stays PII-clean when the feature is off.
+                    if _feishu_capture_user_email_enabled():
+                        email_val = getattr(user, "email", None) or getattr(user, "enterprise_email", None)
+                        if email_val and isinstance(email_val, str):
+                            email_val = email_val.strip()
+                            if email_val:
+                                self._sender_email_cache[trimmed] = (
+                                    email_val,
+                                    now + _FEISHU_SENDER_NAME_TTL_SECONDS,
+                                )
                     return name
         except Exception:
             logger.debug("[Feishu] Failed to resolve sender name for %s", sender_id, exc_info=True)

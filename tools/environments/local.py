@@ -340,9 +340,15 @@ def _make_run_env(env: dict) -> dict:
     # ContextVars don't propagate to child processes, so we bridge them here.
     try:
         from gateway.session_context import _UNSET, _VAR_MAP
+        import json as _json
         for var_name, var in _VAR_MAP.items():
             value = var.get()
             if value is not _UNSET and value:
+                # subprocess.Popen requires all env values to be strings.
+                # ContextVars like HERMES_SESSION_PARTICIPANTS can hold dicts
+                # that break os.fsencode() — serialize them to JSON.
+                if not isinstance(value, str):
+                    value = _json.dumps(value)
                 run_env[var_name] = value
     except Exception:
         pass

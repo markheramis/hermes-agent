@@ -16,7 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,23 @@ def _hash_chat_id(value: str) -> str:
     return _hash_id(value)
 
 
+# Hard cap on per-session participants; FIFO-evicted at the limit.
+MAX_PARTICIPANTS_PER_SESSION = 100
+
+# Fields of SessionEntry persisted to disk. Pair with
+# SESSION_ENTRY_TRANSIENT_FIELDS to ensure no fields are missed by tests.
+SESSION_ENTRY_PERSISTENT_FIELDS = frozenset({
+    "session_key", "session_id", "created_at", "updated_at",
+    "display_name", "platform", "chat_type",
+    "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
+    "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
+    "expiry_finalized", "suspended", "resume_pending", "resume_reason",
+    "last_resume_marked_at", "is_fresh_reset", "was_auto_reset",
+    "auto_reset_reason", "reset_had_activity", "origin",
+})
+SESSION_ENTRY_TRANSIENT_FIELDS = frozenset({"participants"})
+
+
 from .config import (
     Platform,
     GatewayConfig,
@@ -83,6 +100,8 @@ class SessionSource:
     chat_type: str = "dm"  # "dm", "group", "channel", "thread"
     user_id: Optional[str] = None
     user_name: Optional[str] = None
+    user_email: Optional[str] = None  # Email from platform profile (Slack, etc.)
+    participants: Optional[Dict[str, Dict[str, str]]] = None  # {user_id: {name, email, message_count}} for multi-user sessions
     thread_id: Optional[str] = None  # For forum topics, Discord threads, etc.
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
@@ -490,6 +509,11 @@ class SessionEntry:
     resume_pending: bool = False
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
+
+    # Per-session participant roster, surfaced via get_session_participants.
+    # In-memory only — excluded from to_dict()/from_dict() and the SQLite
+    # schema. Cleared on reset/expiry/shutdown by SessionStore.
+    participants: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -1034,6 +1058,78 @@ class SessionStore:
             self._save()
             return True
 
+    def upsert_participant(
+        self,
+        session_key: str,
+        user_id: str,
+        name: str,
+        email: str = "",
+    ) -> None:
+        """Record or bump a participant in ``session_key``'s roster.
+
+        Sanitized through ``BasePlatformAdapter.sanitize_identity``.
+        Existing user_ids bump message_count and refresh name/email;
+        new ones FIFO-evict the oldest when the roster is at
+        MAX_PARTICIPANTS_PER_SESSION. No-op for empty user_id or
+        unknown session_key.
+        """
+        if not user_id:
+            return
+        # Lazy import — avoids a cycle when session.py loads before platforms.
+        from .platforms.base import BasePlatformAdapter
+
+        safe_name = BasePlatformAdapter.sanitize_identity(name or user_id)
+        safe_email = BasePlatformAdapter.sanitize_identity(email, max_len=254)
+
+        with self._lock:
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return
+            existing = entry.participants.get(user_id)
+            if existing is not None:
+                existing["message_count"] = existing.get("message_count", 0) + 1
+                if safe_name:
+                    existing["name"] = safe_name
+                if safe_email:
+                    existing["email"] = safe_email
+                return
+            if len(entry.participants) >= MAX_PARTICIPANTS_PER_SESSION:
+                oldest_uid = next(iter(entry.participants))
+                del entry.participants[oldest_uid]
+            entry.participants[user_id] = {
+                "name": safe_name,
+                "email": safe_email,
+                "message_count": 1,
+                "first_seen": _now().isoformat(),
+            }
+
+    def snapshot_participants(
+        self, session_key: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Return a deep copy of the session's roster (or empty dict)."""
+        with self._lock:
+            entry = self._entries.get(session_key)
+            if entry is None or not entry.participants:
+                return {}
+            return {uid: dict(info) for uid, info in entry.participants.items()}
+
+    def clear_participants_for_session(self, session_id: str) -> int:
+        """Wipe the roster for a session, matched by session_id.
+
+        Keyed on session_id (not session_key) so a late finalize-clear
+        can't clobber a roster that was just rotated by reset_session.
+        Returns the count cleared.
+        """
+        if not session_id:
+            return 0
+        with self._lock:
+            for entry in self._entries.values():
+                if entry.session_id == session_id:
+                    count = len(entry.participants)
+                    entry.participants.clear()
+                    return count
+        return 0
+
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop SessionEntry records older than max_age_days.
 
@@ -1141,6 +1237,10 @@ class SessionStore:
 
             old_entry = self._entries[session_key]
             db_end_session_id = old_entry.session_id
+
+            # Wipe roster in place so stale refs (mid-turn agents, plugins)
+            # see an empty dict, not the prior session's PII.
+            old_entry.participants.clear()
 
             now = _now()
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
