@@ -17,12 +17,13 @@ import {
 import { CSS } from '@dnd-kit/utilities'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
 import { KbdGroup } from '@/components/ui/kbd'
+import { SearchField } from '@/components/ui/search-field'
 import {
   Sidebar,
   SidebarContent,
@@ -33,9 +34,10 @@ import {
   SidebarMenuItem
 } from '@/components/ui/sidebar'
 import { Skeleton } from '@/components/ui/skeleton'
-import type { SessionInfo } from '@/hermes'
+import { searchSessions, type SessionInfo, type SessionSearchResult } from '@/hermes'
 import { cn } from '@/lib/utils'
 import {
+  $panesFlipped,
   $pinnedSessionIds,
   $sidebarAgentsGrouped,
   $sidebarOpen,
@@ -54,7 +56,8 @@ import {
   $sessions,
   $sessionsLoading,
   $sessionsTotal,
-  $workingSessionIds
+  $workingSessionIds,
+  sessionPinId
 } from '@/store/session'
 
 import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
@@ -66,6 +69,12 @@ import { VirtualSessionList } from './virtual-session-list'
 
 const VIRTUALIZE_THRESHOLD = 25
 
+// Render the modifier key the user actually presses on this platform. The
+// global accelerator is bound to both Cmd+N (macOS) and Ctrl+N (everywhere
+// else) in desktop-controller.tsx, but the hint should match muscle memory.
+const NEW_SESSION_KBD: readonly string[] =
+  typeof navigator !== 'undefined' && navigator.platform.toLowerCase().includes('mac') ? ['⌘', 'N'] : ['Ctrl', 'N']
+
 const SIDEBAR_NAV: SidebarNavItem[] = [
   {
     id: 'new-session',
@@ -73,7 +82,12 @@ const SIDEBAR_NAV: SidebarNavItem[] = [
     icon: props => <Codicon name="robot" {...props} />,
     action: 'new-session'
   },
-  { id: 'skills', label: 'Skills & Tools', icon: props => <Codicon name="symbol-misc" {...props} />, route: SKILLS_ROUTE },
+  {
+    id: 'skills',
+    label: 'Skills & Tools',
+    icon: props => <Codicon name="symbol-misc" {...props} />,
+    route: SKILLS_ROUTE
+  },
   { id: 'messaging', label: 'Messaging', icon: props => <Codicon name="comment" {...props} />, route: MESSAGING_ROUTE },
   { id: 'artifacts', label: 'Artifacts', icon: props => <Codicon name="files" {...props} />, route: ARTIFACTS_ROUTE }
 ]
@@ -120,6 +134,32 @@ const baseName = (path: string) =>
     .filter(Boolean)
     .pop()
 
+// FTS results cover sessions that aren't in the loaded page; synthesize a
+// minimal SessionInfo so they render in the same row component (resume works
+// by id; the snippet stands in for the preview).
+function searchResultToSession(result: SessionSearchResult): SessionInfo {
+  const ts = result.session_started ?? Date.now() / 1000
+
+  return {
+    archived: false,
+    cwd: null,
+    ended_at: null,
+    id: result.session_id,
+    _lineage_root_id: result.lineage_root ?? null,
+    input_tokens: 0,
+    is_active: false,
+    last_active: ts,
+    message_count: 0,
+    model: result.model ?? null,
+    output_tokens: 0,
+    preview: result.snippet?.trim() || null,
+    source: result.source ?? null,
+    started_at: ts,
+    title: null,
+    tool_call_count: 0
+  }
+}
+
 function workspaceGroupsFor(sessions: SessionInfo[]): SidebarSessionGroup[] {
   const groups = new Map<string, SidebarSessionGroup>()
 
@@ -131,6 +171,14 @@ function workspaceGroupsFor(sessions: SessionInfo[]): SidebarSessionGroup[] {
     const group = groups.get(id) ?? { id, label, path: path || null, sessions: [] }
     group.sessions.push(session)
     groups.set(id, group)
+  }
+
+  // Groups keep recency order (Map insertion = first-seen in the recency-sorted
+  // input, so an active project floats up), but rows *within* a group sort by
+  // creation time so they don't reshuffle every time a message lands — keeps
+  // muscle memory intact.
+  for (const group of groups.values()) {
+    group.sessions.sort((a, b) => b.started_at - a.started_at)
   }
 
   return [...groups.values()]
@@ -168,6 +216,7 @@ export function ChatSidebar({
   onNewSessionInWorkspace
 }: ChatSidebarProps) {
   const sidebarOpen = useStore($sidebarOpen)
+  const panesFlipped = useStore($panesFlipped)
   const agentsGrouped = useStore($sidebarAgentsGrouped)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const pinsOpen = useStore($sidebarPinsOpen)
@@ -179,6 +228,29 @@ export function ChatSidebar({
   const workingSessionIds = useStore($workingSessionIds)
   const [agentOrderIds, setAgentOrderIds] = useState<string[]>([])
   const [workspaceOrderIds, setWorkspaceOrderIds] = useState<string[]>([])
+  const [searchQuery, setSearchQuery] = useState('')
+  const [serverMatches, setServerMatches] = useState<SessionSearchResult[]>([])
+  const [newSessionKbdFlash, setNewSessionKbdFlash] = useState(false)
+  const trimmedQuery = searchQuery.trim()
+
+  // Flash the ⌘N hint full-opacity (no transition) for the press, so hitting
+  // the shortcut visibly pings its affordance in the sidebar.
+  useEffect(() => {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+
+    const onShortcut = () => {
+      setNewSessionKbdFlash(true)
+      clearTimeout(timeout)
+      timeout = setTimeout(() => setNewSessionKbdFlash(false), 140)
+    }
+
+    window.addEventListener('hermes:new-session-shortcut', onShortcut)
+
+    return () => {
+      window.removeEventListener('hermes:new-session-shortcut', onShortcut)
+      clearTimeout(timeout)
+    }
+  }, [])
 
   const activeSidebarSessionId = currentView === 'chat' ? selectedSessionId : null
 
@@ -189,24 +261,99 @@ export function ChatSidebar({
 
   const sortedSessions = useMemo(() => [...sessions].sort((a, b) => sessionTime(b) - sessionTime(a)), [sessions])
 
-  const sessionsById = useMemo(() => new Map(sessions.map(s => [s.id, s])), [sessions])
   const workingSessionIdSet = useMemo(() => new Set(workingSessionIds), [workingSessionIds])
 
-  const visiblePinnedIds = useMemo(
-    () => pinnedSessionIds.filter(id => sessionsById.has(id)),
-    [pinnedSessionIds, sessionsById]
-  )
+  // Index sessions by both their live id and their lineage-root id so a pin
+  // stored as the pre-compression root resolves to the live continuation tip.
+  const sessionByAnyId = useMemo(() => {
+    const map = new Map<string, SessionInfo>()
 
-  const visiblePinnedIdSet = useMemo(() => new Set(visiblePinnedIds), [visiblePinnedIds])
+    for (const s of sessions) {
+      map.set(s.id, s)
 
-  const pinnedSessions = useMemo(
-    () => visiblePinnedIds.map(id => sessionsById.get(id)!).filter(Boolean),
-    [visiblePinnedIds, sessionsById]
-  )
+      if (s._lineage_root_id && !map.has(s._lineage_root_id)) {
+        map.set(s._lineage_root_id, s)
+      }
+    }
+
+    return map
+  }, [sessions])
+
+  const pinnedSessions = useMemo(() => {
+    const seen = new Set<string>()
+    const out: SessionInfo[] = []
+
+    for (const pinId of pinnedSessionIds) {
+      const session = sessionByAnyId.get(pinId)
+
+      if (session && !seen.has(session.id)) {
+        seen.add(session.id)
+        out.push(session)
+      }
+    }
+
+    return out
+  }, [pinnedSessionIds, sessionByAnyId])
+
+  const pinnedRealIdSet = useMemo(() => new Set(pinnedSessions.map(s => s.id)), [pinnedSessions])
+
+  // Full-text search across *all* sessions (not just the loaded page) so 699
+  // sessions stay findable. Debounced; loaded sessions are matched instantly
+  // client-side and merged ahead of the server hits.
+  useEffect(() => {
+    if (!trimmedQuery) {
+      setServerMatches([])
+
+      return
+    }
+
+    let cancelled = false
+
+    const id = window.setTimeout(() => {
+      void searchSessions(trimmedQuery)
+        .then(res => {
+          if (!cancelled) {
+            setServerMatches(res.results)
+          }
+        })
+        .catch(() => undefined)
+    }, 200)
+
+    return () => {
+      cancelled = true
+      window.clearTimeout(id)
+    }
+  }, [trimmedQuery])
+
+  const searchResults = useMemo(() => {
+    if (!trimmedQuery) {
+      return []
+    }
+
+    const needle = trimmedQuery.toLowerCase()
+    const out = new Map<string, SessionInfo>()
+
+    for (const s of sortedSessions) {
+      if (`${s.title ?? ''} ${s.preview ?? ''} ${s.cwd ?? ''}`.toLowerCase().includes(needle)) {
+        out.set(s.id, s)
+      }
+    }
+
+    for (const match of serverMatches) {
+      if (out.has(match.session_id)) {
+        continue
+      }
+
+      const loaded = sessionByAnyId.get(match.session_id)
+      out.set(match.session_id, loaded ?? searchResultToSession(match))
+    }
+
+    return [...out.values()]
+  }, [trimmedQuery, sortedSessions, serverMatches, sessionByAnyId])
 
   const unpinnedAgentSessions = useMemo(
-    () => sortedSessions.filter(s => !visiblePinnedIdSet.has(s.id)),
-    [sortedSessions, visiblePinnedIdSet]
+    () => sortedSessions.filter(s => !pinnedRealIdSet.has(s.id)),
+    [sortedSessions, pinnedRealIdSet]
   )
 
   const agentSessions = useMemo(
@@ -236,7 +383,10 @@ export function ChatSidebar({
       return
     }
 
-    reorderPinnedSession(String(active.id), newIndex)
+    // Sortable ids are live session ids; the pinned store is keyed by durable
+    // (lineage-root) ids, so translate before reordering.
+    const dragged = sessionByAnyId.get(String(active.id))
+    reorderPinnedSession(dragged ? sessionPinId(dragged) : String(active.id), newIndex)
   }
 
   const handleAgentDragEnd = ({ active, over }: DragEndEvent) => {
@@ -279,7 +429,8 @@ export function ChatSidebar({
   return (
     <Sidebar
       className={cn(
-        'relative h-full min-w-0 overflow-hidden border-r border-t-0 border-b-0 border-l-0 text-foreground transition-none',
+        'relative h-full min-w-0 overflow-hidden border-t-0 border-b-0 text-foreground transition-none',
+        panesFlipped ? 'border-l border-r-0' : 'border-r border-l-0',
         sidebarOpen
           ? 'border-(--sidebar-edge-border) bg-(--ui-sidebar-surface-background) opacity-100'
           : 'pointer-events-none border-transparent bg-transparent opacity-0'
@@ -303,7 +454,7 @@ export function ChatSidebar({
                     <SidebarMenuButton
                       aria-disabled={!isInteractive}
                       className={cn(
-                        'flex h-7 w-full cursor-pointer justify-start gap-2 rounded-md border border-transparent px-2 text-left text-[0.8125rem] font-medium text-(--ui-text-secondary) transition-colors duration-100 ease-out hover:bg-(--ui-control-hover-background) hover:text-foreground hover:transition-none',
+                        'flex h-7 w-full justify-start gap-2 rounded-md border border-transparent px-2 text-left text-[0.8125rem] font-medium text-(--ui-text-secondary) transition-colors duration-100 ease-out hover:bg-(--ui-control-hover-background) hover:text-foreground hover:transition-none',
                         active &&
                           'border-(--ui-stroke-tertiary) bg-(--ui-control-active-background) text-foreground shadow-none hover:border-(--ui-stroke-tertiary)!',
                         !isInteractive &&
@@ -318,7 +469,10 @@ export function ChatSidebar({
                         <>
                           <span className="min-w-0 flex-1 truncate max-[46.25rem]:hidden">{item.label}</span>
                           {item.id === 'new-session' && (
-                            <KbdGroup className="ml-auto max-[46.25rem]:hidden" keys={['⇧', 'N']} />
+                            <KbdGroup
+                              className={cn('ml-auto max-[46.25rem]:hidden', newSessionKbdFlash && 'opacity-100!')}
+                              keys={[...NEW_SESSION_KBD]}
+                            />
                           )}
                         </>
                       )}
@@ -331,6 +485,41 @@ export function ChatSidebar({
         </SidebarGroup>
 
         {sidebarOpen && showSessionSections && (
+          <div className="shrink-0 px-2 pb-1 pt-1">
+            <SearchField
+              aria-label="Search sessions"
+              onChange={setSearchQuery}
+              placeholder="Search sessions…"
+              value={searchQuery}
+            />
+          </div>
+        )}
+
+        {sidebarOpen && showSessionSections && trimmedQuery && (
+          <SidebarSessionsSection
+            activeSessionId={activeSidebarSessionId}
+            contentClassName="flex min-h-0 flex-1 flex-col gap-px overflow-y-auto overscroll-contain pb-1.75"
+            emptyState={
+              <div className="grid min-h-24 place-items-center rounded-lg px-2 text-center text-xs text-(--ui-text-tertiary)">
+                No sessions match “{trimmedQuery}”.
+              </div>
+            }
+            label="Results"
+            labelMeta={String(searchResults.length)}
+            onArchiveSession={onArchiveSession}
+            onDeleteSession={onDeleteSession}
+            onResumeSession={onResumeSession}
+            onToggle={() => undefined}
+            onTogglePin={pinSession}
+            open
+            pinned={false}
+            rootClassName="min-h-0 flex-1 p-0"
+            sessions={searchResults}
+            workingSessionIdSet={workingSessionIdSet}
+          />
+        )}
+
+        {sidebarOpen && showSessionSections && !trimmedQuery && (
           <SidebarSessionsSection
             activeSessionId={activeSidebarSessionId}
             contentClassName="flex min-h-10 shrink-0 flex-col gap-px rounded-lg pb-2 pt-1"
@@ -352,7 +541,7 @@ export function ChatSidebar({
           />
         )}
 
-        {sidebarOpen && showSessionSections && (
+        {sidebarOpen && showSessionSections && !trimmedQuery && (
           <SidebarSessionsSection
             activeSessionId={activeSidebarSessionId}
             contentClassName="flex min-h-0 flex-1 flex-col gap-px overflow-y-auto overscroll-contain pb-1.75"
@@ -370,23 +559,28 @@ export function ChatSidebar({
             forceEmptyState={showSessionSkeletons}
             groups={agentsGrouped ? agentGroups : undefined}
             headerAction={
-              <Button
-                aria-label={agentsGrouped ? 'Show sessions as a single list' : 'Group sessions by workspace'}
-                className={cn(
-                  'cursor-pointer text-(--ui-text-tertiary) opacity-70 hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100 focus-visible:opacity-100',
-                  agentsGrouped && 'bg-(--ui-control-active-background) text-foreground opacity-100'
-                )}
-                onClick={event => {
-                  event.stopPropagation()
-                  setSidebarRecentsOpen(true)
-                  setSidebarAgentsGrouped(!agentsGrouped)
-                }}
-                size="icon-xs"
-                title={agentsGrouped ? 'Ungroup sessions' : 'Group by workspace'}
-                variant="ghost"
-              >
-                <Codicon name={agentsGrouped ? 'list-unordered' : 'root-folder'} size="0.75rem" />
-              </Button>
+              // Grouping operates on unpinned recents; if everything is
+              // pinned the toggle does nothing visible, so hide it to avoid
+              // a phantom click target.
+              agentSessions.length > 0 ? (
+                <Button
+                  aria-label={agentsGrouped ? 'Show sessions as a single list' : 'Group sessions by workspace'}
+                  className={cn(
+                    'text-(--ui-text-tertiary) opacity-70 hover:bg-(--ui-control-hover-background) hover:text-foreground hover:opacity-100 focus-visible:opacity-100',
+                    agentsGrouped && 'bg-(--ui-control-active-background) text-foreground opacity-100'
+                  )}
+                  onClick={event => {
+                    event.stopPropagation()
+                    setSidebarRecentsOpen(true)
+                    setSidebarAgentsGrouped(!agentsGrouped)
+                  }}
+                  size="icon-xs"
+                  title={agentsGrouped ? 'Ungroup sessions' : 'Group by workspace'}
+                  variant="ghost"
+                >
+                  <Codicon name={agentsGrouped ? 'list-unordered' : 'root-folder'} size="0.75rem" />
+                </Button>
+              ) : null
             }
             label="Sessions"
             labelMeta={countLabel(agentSessions.length, knownSessionTotal)}
@@ -422,7 +616,7 @@ function SidebarSectionHeader({ label, open, onToggle, action, meta }: SidebarSe
   return (
     <div className="group/section flex shrink-0 items-center justify-between pb-1 pt-1.5">
       <button
-        className="group/section-label flex w-fit cursor-pointer items-center gap-1 bg-transparent text-left leading-none"
+        className="group/section-label flex w-fit items-center gap-1 bg-transparent text-left leading-none"
         onClick={onToggle}
         type="button"
       >
@@ -463,7 +657,7 @@ function SidebarPinnedEmptyState() {
       <span className="grid w-3.5 shrink-0 place-items-center text-(--ui-text-quaternary)">
         <Codicon name="pin" size="0.75rem" />
       </span>
-      <span>Shift click to pin a chat</span>
+      <span>Shift-click a chat to pin</span>
     </div>
   )
 }
@@ -536,7 +730,7 @@ function SidebarSessionsSection({
       isWorking: workingSessionIdSet.has(session.id),
       onArchive: () => onArchiveSession(session.id),
       onDelete: () => onDeleteSession(session.id),
-      onPin: () => onTogglePin(session.id),
+      onPin: () => onTogglePin(sessionPinId(session)),
       onResume: () => onResumeSession(session.id),
       session
     }
@@ -666,7 +860,7 @@ function SidebarWorkspaceGroup({
     <div className={cn('grid gap-px', dragging && 'z-10 opacity-60', className)} ref={ref} style={style} {...rest}>
       <div className="group/workspace flex min-h-6 items-center gap-1 px-2 pt-1 text-[0.6875rem] font-medium text-(--ui-text-tertiary)">
         <button
-          className="flex min-w-0 cursor-pointer items-center gap-1 bg-transparent text-left hover:text-(--ui-text-secondary)"
+          className="flex min-w-0 items-center gap-1 bg-transparent text-left hover:text-(--ui-text-secondary)"
           onClick={() => setOpen(value => !value)}
           title={group.path ?? undefined}
           type="button"
@@ -681,7 +875,7 @@ function SidebarWorkspaceGroup({
         {onNewSession && (
           <button
             aria-label={`New session in ${group.label}`}
-            className="grid size-4 shrink-0 cursor-pointer place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/workspace:opacity-100"
+            className="grid size-4 shrink-0 place-items-center rounded-sm bg-transparent text-(--ui-text-quaternary) opacity-0 transition-opacity hover:bg-(--ui-control-hover-background) hover:text-foreground group-hover/workspace:opacity-100"
             onClick={() => onNewSession(group.path)}
             title={`New session in ${group.label}`}
             type="button"
@@ -713,7 +907,7 @@ function SidebarWorkspaceGroup({
           {hiddenCount > 0 && (
             <button
               aria-label={`Show ${nextCount} more in ${group.label}`}
-              className="ml-auto grid size-5 cursor-pointer place-items-center rounded-sm bg-transparent text-(--ui-text-tertiary) transition-colors hover:bg-(--ui-control-hover-background) hover:text-foreground"
+              className="ml-auto grid size-5 place-items-center rounded-sm bg-transparent text-(--ui-text-tertiary) transition-colors hover:bg-(--ui-control-hover-background) hover:text-foreground"
               onClick={() => setVisibleCount(count => count + WORKSPACE_PAGE)}
               title={`Show ${nextCount} more in ${group.label}`}
               type="button"
@@ -767,7 +961,7 @@ function SidebarLoadMoreRow({ loading, onClick, step }: SidebarLoadMoreRowProps)
 
   return (
     <button
-      className="flex min-h-5 cursor-pointer items-center gap-1 self-start bg-transparent pl-2 text-left text-[0.6875rem] text-(--ui-text-tertiary) transition-colors duration-100 ease-out hover:text-foreground hover:transition-none disabled:cursor-default disabled:opacity-60 disabled:hover:text-(--ui-text-tertiary)"
+      className="flex min-h-5 items-center gap-1 self-start bg-transparent pl-2 text-left text-[0.6875rem] text-(--ui-text-tertiary) transition-colors duration-100 ease-out hover:text-foreground hover:transition-none disabled:cursor-default disabled:opacity-60 disabled:hover:text-(--ui-text-tertiary)"
       disabled={loading}
       onClick={onClick}
       type="button"
