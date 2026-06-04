@@ -156,13 +156,15 @@ def clear_session_vars(tokens: list) -> None:
         _SESSION_THREAD_ID,
         _SESSION_USER_ID,
         _SESSION_USER_NAME,
+        _SESSION_USER_EMAIL,
         _SESSION_KEY,
         _SESSION_MESSAGE_ID,
     ):
         var.set("")
+    _SESSION_PARTICIPANTS.set({})
 
 
-def get_session_env(name: str, default: str = "") -> str:
+def get_session_env(name: str, default: str = "") -> Any:
     """Read a session context variable by its legacy ``HERMES_SESSION_*`` name.
 
     Drop-in replacement for ``os.getenv("HERMES_SESSION_*", default)``.
@@ -176,6 +178,14 @@ def get_session_env(name: str, default: str = "") -> str:
        this context — i.e. CLI, cron scheduler, and test processes that
        don't use ``set_session_vars`` at all).
     3. *default*
+
+    Return type is normally ``str`` (matching ``os.getenv``), but
+    ``HERMES_SESSION_PARTICIPANTS`` holds a ``Dict[str, Dict[str, Any]]``
+    when set in-process (it serializes to a JSON string only when bridged
+    to a subprocess via ``tools/environments/local.py``). Callers reading
+    that key must accept either ``dict`` or ``str``; see
+    ``tools/session_participants_tool.py::_parse_participants_envvar``
+    for the canonical decode.
     """
     import os
 

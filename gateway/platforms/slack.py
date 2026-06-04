@@ -300,6 +300,18 @@ def _resolve_slack_proxy_url() -> Optional[str]:
     return proxy_url
 
 
+def _slack_capture_user_email_enabled() -> bool:
+    """Opt-in flag for collecting Slack user email; gated at both read and write.
+
+    Mirrors FEISHU_CAPTURE_USER_EMAIL semantics: flipping the env var off
+    must drop cached PII rather than leave it in memory for the process
+    lifetime.
+    """
+    return os.getenv("SLACK_CAPTURE_USER_EMAIL", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 class SlackAdapter(BasePlatformAdapter):
     """
     Slack bot adapter using Socket Mode.
@@ -1702,11 +1714,14 @@ class SlackAdapter(BasePlatformAdapter):
             )
             # Sanitize to prevent prompt injection via display names.
             name = self.sanitize_identity(name)
-            email = profile.get("email", "")
-            email = self.sanitize_identity(email, max_len=254)
             self._user_name_cache[user_id] = name
-            if email:
-                self._user_email_cache[user_id] = email
+            # Email capture is opt-in — gated at write so disabling the flag
+            # drops cached PII instead of leaving it in memory.
+            if _slack_capture_user_email_enabled():
+                email = profile.get("email", "")
+                email = self.sanitize_identity(email, max_len=254)
+                if email:
+                    self._user_email_cache[user_id] = email
             return name
         except Exception as e:
             logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
@@ -1722,8 +1737,7 @@ class SlackAdapter(BasePlatformAdapter):
         scope.  Returns empty string gracefully when the feature is off or
         the scope is missing.
         """
-        import os as _os
-        if _os.getenv("SLACK_CAPTURE_USER_EMAIL", "0").strip().lower() not in ("1", "true", "yes", "on"):
+        if not _slack_capture_user_email_enabled():
             return ""
         if not user_id:
             return ""

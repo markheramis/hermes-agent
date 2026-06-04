@@ -1528,8 +1528,27 @@ class PluginManager:
         )
 
     # -----------------------------------------------------------------------
-    # Hook invocation
+    # Hook registration / invocation
     # -----------------------------------------------------------------------
+
+    def register_hook(self, hook_name: str, callback: Callable) -> None:
+        """Register a lifecycle hook callback from non-plugin code.
+
+        Plugins normally register hooks through ``PluginContext.register_hook``
+        during ``register()``.  Core gateway code that needs to subscribe to
+        a lifecycle event (e.g. session-finalize cleanup) should use this
+        method rather than touching ``self._hooks`` directly.
+
+        Unknown hook names produce a warning but are still stored, mirroring
+        ``PluginContext.register_hook`` for forward compatibility.
+        """
+        if hook_name not in VALID_HOOKS:
+            logger.warning(
+                "Core code registered unknown hook '%s' (valid: %s)",
+                hook_name,
+                ", ".join(sorted(VALID_HOOKS)),
+            )
+        self._hooks.setdefault(hook_name, []).append(callback)
 
     def invoke_hook(self, hook_name: str, **kwargs: Any) -> List[Any]:
         """Call all registered callbacks for *hook_name*.

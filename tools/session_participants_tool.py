@@ -90,8 +90,13 @@ def get_session_participants_tool(
     for user_id, info in roster.items():
         if not isinstance(info, dict):
             continue
+        # Don't fall back to the raw platform user_id (e.g. Slack ``Uxxxxxxx``)
+        # — surfacing it as ``name`` would let the agent quote opaque IDs as
+        # if they were human-readable names. Mark it explicitly instead.
+        raw_name = info.get("name", "")
+        name = str(raw_name).strip() if raw_name else ""
         items.append({
-            "name": str(info.get("name", user_id) or user_id),
+            "name": name or "(unknown)",
             "email": str(info.get("email", "") or ""),
             "message_count": int(info.get("message_count", 0) or 0),
             "first_seen": str(info.get("first_seen", "") or ""),

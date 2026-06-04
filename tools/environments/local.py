@@ -338,6 +338,16 @@ def _make_run_env(env: dict) -> dict:
 
     # Inject ContextVar-based session vars into subprocess env.
     # ContextVars don't propagate to child processes, so we bridge them here.
+    #
+    # PII / threat-model note: HERMES_SESSION_USER_EMAIL and
+    # HERMES_SESSION_PARTICIPANTS (when populated) carry user emails into
+    # the child's environment. On Linux these are readable via
+    # /proc/<pid>/environ by any process running under the same UID, and
+    # on macOS via ``ps -E``. The current threat model assumes everything
+    # under the agent's UID is trusted (same-user privilege). If this
+    # bridge is ever extended to less-trusted subprocesses (sandboxed
+    # code-exec, untrusted plugins, network-exposed workers), the
+    # participant/email vars MUST be filtered out here.
     try:
         from gateway.session_context import _UNSET, _VAR_MAP
         import json as _json

@@ -4593,13 +4593,17 @@ class BasePlatformAdapter(ABC):
     # Strips C0/C1 controls, zero-width chars (ZWSP/ZWNJ/ZWJ/LRM/RLM/BOM),
     # and bidi overrides (LRE/RLE/PDF/LRO/RLO/LRI/RLI/FSI/PDI) — all known
     # prompt-injection / display-spoofing vectors in user-controlled names.
+    # Codepoints are spelled with \u/\x escapes (NOT literal characters)
+    # so an editor's "strip invisible chars" pass can't silently break
+    # the regex.
     _IDENTITY_STRIP_RE = re.compile(
-        r'[\x00-\x1f\x7f-\x9f'
-        r'​-‏'
-        r'﻿'
-        r'‪-‮'
-        r'⁦-⁩'
-        r']'
+        "["
+        "\x00-\x1f\x7f-\x9f"        # C0 + C1 controls
+        "\u200b-\u200f"                # ZWSP, ZWNJ, ZWJ, LRM, RLM
+        "\ufeff"                        # BOM / ZWNBSP
+        "\u202a-\u202e"                # LRE, RLE, PDF, LRO, RLO
+        "\u2066-\u2069"                # LRI, RLI, FSI, PDI
+        "]"
     )
 
     @staticmethod

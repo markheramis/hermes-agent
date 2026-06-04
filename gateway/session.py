@@ -1119,6 +1119,9 @@ class SessionStore:
         Keyed on session_id (not session_key) so a late finalize-clear
         can't clobber a roster that was just rotated by reset_session.
         Returns the count cleared.
+
+        O(N) over all entries. Prefer ``clear_participants_for_key`` when
+        the caller already has the session_key (e.g. the expiry watcher).
         """
         if not session_id:
             return 0
@@ -1129,6 +1132,23 @@ class SessionStore:
                     entry.participants.clear()
                     return count
         return 0
+
+    def clear_participants_for_key(self, session_key: str) -> int:
+        """O(1) participant clear when the caller already has the session_key.
+
+        Use this in hot paths (expiry sweep, reset) instead of
+        ``clear_participants_for_session``, which has to linear-scan the
+        whole store. Returns the count cleared.
+        """
+        if not session_key:
+            return 0
+        with self._lock:
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return 0
+            count = len(entry.participants)
+            entry.participants.clear()
+            return count
 
     def prune_old_entries(self, max_age_days: int) -> int:
         """Drop SessionEntry records older than max_age_days.

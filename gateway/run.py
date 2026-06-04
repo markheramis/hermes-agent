@@ -1691,7 +1691,7 @@ def _register_participant_cleanup_listener(session_store) -> None:
 
     try:
         manager = get_plugin_manager()
-        manager._hooks.setdefault("on_session_finalize", []).append(_on_finalize)
+        manager.register_hook("on_session_finalize", _on_finalize)
         _PARTICIPANT_CLEANUP_LISTENER_REGISTERED = True
     except Exception as exc:
         logger.debug("participant cleanup listener: registration failed (%s)", exc)
@@ -5028,15 +5028,18 @@ class GatewayRunner:
                         except Exception:
                             pass
                         # Wipe roster even if the hook above swallowed an error.
+                        # Use the O(1) by-key path — expiry sweeps can touch
+                        # many entries and the by-session_id variant linear-
+                        # scans the whole store.
                         try:
-                            _cleared = self.session_store.clear_participants_for_session(entry.session_id)
+                            _cleared = self.session_store.clear_participants_for_key(key)
                             if _cleared:
                                 logger.debug(
                                     "Session expiry: cleared %d participant(s) for %s",
                                     _cleared, entry.session_id,
                                 )
                         except Exception as _exc:
-                            logger.debug("clear_participants_for_session raised during expiry: %s", _exc)
+                            logger.debug("clear_participants_for_key raised during expiry: %s", _exc)
                         # Shut down memory provider and close tool resources
                         # on the cached agent.  Idle agents live in
                         # _agent_cache (not _running_agents), so look there.
@@ -8459,9 +8462,12 @@ class GatewayRunner:
             thread_sessions_per_user=_thread_sessions_per_user,
         )
         if _is_shared_multi_user and source.user_name:
-            # Sanitize: strip control chars, limit to 80 chars (defense in depth
-            # even though the adapter already sanitizes on resolve).
-            _safe_name = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', str(source.user_name))[:80].strip()
+            # Defense in depth: re-run the shared sanitizer over the name even
+            # though the adapter already scrubbed it on resolve. Uses the
+            # same control/zero-width/bidi strip as sanitize_identity so this
+            # boundary can never be weaker than the adapter's.
+            from gateway.platforms.base import BasePlatformAdapter
+            _safe_name = BasePlatformAdapter.sanitize_identity(str(source.user_name))
             if _safe_name:
                 message_text = f"[{_safe_name}] {message_text}"
 

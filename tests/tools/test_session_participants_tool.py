@@ -91,12 +91,18 @@ class TestPopulatedPath:
         names = [p["name"] for p in out["participants"]]
         assert names == ["Bob", "Carol", "Alice"]
 
-    def test_user_id_falls_back_to_name_when_missing(self):
+    def test_missing_name_does_not_leak_opaque_user_id(self):
+        """When ``name`` is missing the tool must NOT fall back to the raw
+        platform user_id (e.g. Slack ``Uxxxxxxx``) — opaque IDs read as
+        garbage when the agent then quotes them as if they were a person's
+        name. Use an explicit placeholder instead."""
         os.environ["HERMES_SESSION_PARTICIPANTS"] = json.dumps({
             "u-anon": {"email": "", "message_count": 1, "first_seen": ""},
         })
         out = json.loads(get_session_participants_tool({}))
-        assert out["participants"][0]["name"] == "u-anon"
+        assert out["participants"][0]["name"] == "(unknown)"
+        # And critically: the raw user_id must not appear as a name.
+        assert "u-anon" not in [p["name"] for p in out["participants"]]
 
     def test_no_note_when_populated(self):
         os.environ["HERMES_SESSION_PARTICIPANTS"] = json.dumps({

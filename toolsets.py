@@ -50,6 +50,8 @@ _HERMES_CORE_TOOLS = [
     "todo", "memory",
     # Session history search
     "session_search",
+    # Session participant roster (multi-user channels; empty in DM/CLI)
+    "get_session_participants",
     # Clarifying questions
     "clarify",
     # Code execution + delegation
