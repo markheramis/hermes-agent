@@ -17,7 +17,7 @@ Example config::
         command: "npx"
         args: ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
         env: {}
-        timeout: 120         # per-tool-call timeout in seconds (default: 120)
+        timeout: 120         # per-tool-call timeout in seconds (default: 300)
         connect_timeout: 60  # initial connection timeout (default: 60)
       github:
         command: "npx"
@@ -78,6 +78,7 @@ Thread safety:
 """
 
 import asyncio
+import contextvars
 import concurrent.futures
 import inspect
 import json
@@ -89,8 +90,9 @@ import shutil
 import sys
 import threading
 import time
+from typing import Callable
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Coroutine, Dict, List, Optional
 from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
@@ -175,6 +177,7 @@ _MCP_AVAILABLE = False
 _MCP_HTTP_AVAILABLE = False
 _MCP_SAMPLING_TYPES = False
 _MCP_NOTIFICATION_TYPES = False
+_MCP_ELICITATION_TYPES = False
 _MCP_MESSAGE_HANDLER_SUPPORTED = False
 # Conservative fallback for SDK builds that don't export LATEST_PROTOCOL_VERSION.
 # Streamable HTTP was introduced by 2025-03-26, so this remains valid for the
@@ -220,6 +223,16 @@ try:
         _MCP_SAMPLING_TYPES = True
     except ImportError:
         logger.debug("MCP sampling types not available -- sampling disabled")
+    # Elicitation types -- gated separately for the same reason as sampling.
+    # Added in mcp Python SDK 1.11.0 (Jul 2025); servers use elicitation to
+    # ask the client for structured input mid-tool-call (e.g. payment
+    # authorization). Missing types just disable the feature; everything
+    # else keeps working.
+    try:
+        from mcp.types import ElicitRequestParams, ElicitResult
+        _MCP_ELICITATION_TYPES = True
+    except ImportError:
+        logger.debug("MCP elicitation types not available -- elicitation disabled")
     # Notification types for dynamic tool discovery (tools/list_changed)
     try:
         from mcp.types import (
@@ -257,7 +270,7 @@ if _MCP_AVAILABLE and not _MCP_MESSAGE_HANDLER_SUPPORTED:
 # Constants
 # ---------------------------------------------------------------------------
 
-_DEFAULT_TOOL_TIMEOUT = 120      # seconds for tool calls
+_DEFAULT_TOOL_TIMEOUT = 300      # seconds for tool calls
 _DEFAULT_CONNECT_TIMEOUT = 60    # seconds for initial connection per server
 _MAX_RECONNECT_RETRIES = 5
 _MAX_INITIAL_CONNECT_RETRIES = 3 # retries for the very first connection attempt
@@ -266,6 +279,38 @@ _MAX_BACKOFF_SECONDS = 60
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
+})
+
+_SAFE_ENV_KEYS_CASE_INSENSITIVE = frozenset({
+    # Windows process/location vars. These are needed by launcher-style tools
+    # such as Docker Desktop's MCP plugin discovery, and do not carry secrets.
+    "ALLUSERSPROFILE",
+    "APPDATA",
+    "COMMONPROGRAMFILES",
+    "COMMONPROGRAMFILES(X86)",
+    "COMMONPROGRAMW6432",
+    "COMPUTERNAME",
+    "COMSPEC",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "NUMBER_OF_PROCESSORS",
+    "OS",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "PROGRAMDATA",
+    "PROGRAMFILES",
+    "PROGRAMFILES(X86)",
+    "PROGRAMW6432",
+    "PUBLIC",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "TMP",
+    "USERDOMAIN",
+    "USERNAME",
+    "USERPROFILE",
+    "WINDIR",
 })
 
 # Regex for credential patterns to strip from error messages
@@ -305,7 +350,11 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
     """
     env = {}
     for key, value in os.environ.items():
-        if key in _SAFE_ENV_KEYS or key.startswith("XDG_"):
+        if (
+            key in _SAFE_ENV_KEYS
+            or key.upper() in _SAFE_ENV_KEYS_CASE_INSENSITIVE
+            or key.startswith("XDG_")
+        ):
             env[key] = value
     if user_env:
         env.update(user_env)
@@ -1105,6 +1154,193 @@ class SamplingHandler:
 
 
 # ---------------------------------------------------------------------------
+# Elicitation handler
+# ---------------------------------------------------------------------------
+
+def _format_elicitation_schema_summary(schema: dict, server_name: str) -> str:
+    """Render a JSON-schema-ish requested_schema to a human-readable field list.
+
+    Elicitation schemas are restricted to a flat object with named top-level
+    properties. We surface field names, types, and descriptions so the user
+    can tell what the server is asking for before approving.
+    """
+    props = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(props, dict) or not props:
+        return f"Approval requested by MCP server '{server_name}'."
+
+    lines = [f"Fields requested by MCP server '{server_name}':"]
+    for field_name, field_spec in props.items():
+        field_type = ""
+        field_desc = ""
+        if isinstance(field_spec, dict):
+            field_type = str(field_spec.get("type", "") or "")
+            field_desc = str(field_spec.get("description", "") or "")
+        suffix = f" ({field_type})" if field_type else ""
+        if field_desc:
+            lines.append(f"  - {field_name}{suffix}: {field_desc}")
+        else:
+            lines.append(f"  - {field_name}{suffix}")
+    return "\n".join(lines)
+
+
+class ElicitationHandler:
+    """Handles ``elicitation/create`` requests for a single MCP server.
+
+    Each ``MCPServerTask`` that has elicitation enabled creates one handler.
+    The handler is callable and passed directly to ``ClientSession`` as the
+    ``elicitation_callback`` (added in mcp Python SDK 1.11.0).
+
+    Elicitation lets a server ask the client to collect structured input from
+    the user mid-tool-call (e.g. payment authorization, OAuth confirmation).
+    Form-mode elicitations are routed through Hermes' existing approval
+    system (``tools.approval.prompt_dangerous_approval``), which surfaces
+    the prompt on whichever surface the active session uses -- CLI, TUI,
+    Telegram, Slack, etc. URL-mode elicitations are declined as unsupported.
+
+    Failure modes are fail-closed: any timeout, exception, or unexpected
+    state returns ``decline``/``cancel`` rather than silently accepting.
+    The server treats this as the user not approving.
+    """
+
+    # Outer cap for the approval await. ``prompt_dangerous_approval`` runs
+    # its own input() timeout via the approval-config value; this is an
+    # asyncio-side safety net so the MCP event loop never blocks
+    # indefinitely if the inner timeout machinery is bypassed.
+    _OUTER_TIMEOUT_GRACE_SECONDS = 5
+
+    def __init__(self, server_name: str, config: dict, owner: Optional["MCPServerTask"] = None):
+        self.server_name = server_name
+        # Per-elicitation timeout. Default 5 min mirrors the gateway approval
+        # default so users on async surfaces (Telegram, Slack) have time to
+        # respond before the server gives up.
+        self.timeout = _safe_numeric(config.get("timeout", 300), 300, float)
+        # Back-reference to the MCPServerTask so we can read the agent's
+        # captured contextvars snapshot at elicitation time. Optional so
+        # the handler stays unit-testable in isolation.
+        self.owner = owner
+        self.metrics = {
+            "requests": 0,
+            "accepted": 0,
+            "declined": 0,
+            "errors": 0,
+        }
+
+    def session_kwargs(self) -> dict:
+        """Return kwargs to pass to ClientSession for elicitation support."""
+        return {"elicitation_callback": self}
+
+    async def __call__(self, context, params):
+        """Elicitation callback invoked by the MCP SDK.
+
+        Conforms to ``ElicitationFnT`` protocol. Returns ``ElicitResult``
+        or ``ErrorData``.
+        """
+        self.metrics["requests"] += 1
+
+        # URL-mode elicitations point the user to an external URL for
+        # sensitive out-of-band flows (OAuth, payment processing). Honouring
+        # them requires opening a browser to that URL and waiting for the
+        # server's notifications/elicitation/complete -- out of scope for
+        # the initial implementation. Decline cleanly so the server does
+        # not hang.
+        mode = getattr(params, "mode", "form")
+        if mode == "url":
+            logger.info(
+                "MCP server '%s' requested URL-mode elicitation; "
+                "declining (URL-mode elicitation not implemented)",
+                self.server_name,
+            )
+            self.metrics["declined"] += 1
+            return ElicitResult(action="decline")
+
+        message = getattr(params, "message", "") or (
+            f"MCP server '{self.server_name}' is requesting your approval"
+        )
+        schema = getattr(params, "requested_schema", {}) or {}
+        description = _format_elicitation_schema_summary(schema, self.server_name)
+
+        logger.info(
+            "MCP server '%s' elicitation request: %s",
+            self.server_name, _sanitize_error(message)[:200],
+        )
+
+        # Lazy import: tools.approval is imported very early during process
+        # bootstrap; matching the lazy pattern used by _fire_approval_hook
+        # avoids any chance of import-order coupling.
+        try:
+            from tools.approval import request_elicitation_consent
+        except Exception as exc:  # pragma: no cover -- defensive
+            logger.error(
+                "MCP server '%s' elicitation: approval system unavailable: %s",
+                self.server_name, exc,
+            )
+            self.metrics["errors"] += 1
+            return ElicitResult(action="decline")
+
+        # Offload the sync consent flow to a worker thread. Running it
+        # inline would freeze the MCP background event loop, blocking every
+        # other RPC on this session. request_elicitation_consent() routes
+        # itself to the right surface (gateway notify_cb for Telegram /
+        # Slack / etc., prompt_dangerous_approval for CLI / TUI) and
+        # normalizes the answer to one of accept / decline / cancel.
+        #
+        # The recv-loop task that fires this callback does NOT inherit
+        # the agent's contextvars (HERMES_SESSION_PLATFORM etc.). When
+        # the MCP tool wrapper captured the agent's context onto
+        # owner._pending_call_context we replay it here via
+        # contextvars.Context.run so the gateway-platform detection in
+        # request_elicitation_consent picks up the right session.
+        captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+
+        def _invoke_consent() -> str:
+            if captured is None:
+                return request_elicitation_consent(
+                    message,
+                    description,
+                    timeout_seconds=int(self.timeout),
+                    surface=f"mcp-elicitation/{self.server_name}",
+                )
+            # Context.run can only execute a context once — copy to allow
+            # multiple elicitations within a single tool call.
+            return captured.copy().run(
+                request_elicitation_consent,
+                message,
+                description,
+                timeout_seconds=int(self.timeout),
+                surface=f"mcp-elicitation/{self.server_name}",
+            )
+
+        try:
+            answer = await asyncio.wait_for(
+                asyncio.to_thread(_invoke_consent),
+                timeout=self.timeout + self._OUTER_TIMEOUT_GRACE_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP server '%s' elicitation timed out after %ds",
+                self.server_name, int(self.timeout),
+            )
+            self.metrics["errors"] += 1
+            return ElicitResult(action="cancel")
+        except Exception as exc:
+            logger.error(
+                "MCP server '%s' elicitation failed: %s",
+                self.server_name, exc, exc_info=True,
+            )
+            self.metrics["errors"] += 1
+            return ElicitResult(action="decline")
+
+        if answer == "accept":
+            self.metrics["accepted"] += 1
+            return ElicitResult(action="accept", content={})
+        if answer == "cancel":
+            self.metrics["errors"] += 1
+            return ElicitResult(action="cancel")
+        self.metrics["declined"] += 1
+        return ElicitResult(action="decline")
+
+
+# ---------------------------------------------------------------------------
 # Server task -- each MCP server lives in one long-lived asyncio Task
 # ---------------------------------------------------------------------------
 
@@ -1122,8 +1358,10 @@ class MCPServerTask:
         "name", "session", "tool_timeout",
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
         "_tools", "_error", "_config",
-        "_sampling", "_registered_tool_names", "_auth_type", "_refresh_lock",
+        "_sampling", "_elicitation",
+        "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
+        "_pending_call_context",
         "initialize_result",
     )
 
@@ -1144,6 +1382,7 @@ class MCPServerTask:
         self._error: Optional[Exception] = None
         self._config: dict = {}
         self._sampling: Optional[SamplingHandler] = None
+        self._elicitation: Optional[ElicitationHandler] = None
         self._registered_tool_names: list[str] = []
         self._auth_type: str = ""
         self._refresh_lock = asyncio.Lock()
@@ -1155,6 +1394,16 @@ class MCPServerTask:
         # transports for conservative per-server ordering.
         self._rpc_lock = asyncio.Lock()
         self._pending_refresh_tasks: set[asyncio.Task] = set()
+        # contextvars snapshot of the agent task that's currently in
+        # session.call_tool(). The MCP recv loop dispatches incoming
+        # elicitation/create requests on a SEPARATE asyncio task whose
+        # context doesn't inherit HERMES_SESSION_PLATFORM, so the
+        # elicitation handler has no way to detect the gateway session
+        # that triggered the call. Capturing the agent's context here
+        # and replaying it inside the elicitation callback restores
+        # gateway-platform attribution and routes the approval prompt
+        # to the right surface (Telegram, Slack, etc.).
+        self._pending_call_context: Optional[contextvars.Context] = None
         # Captures the ``InitializeResult`` returned by
         # ``await session.initialize()`` so downstream code can inspect the
         # server's real advertised capabilities (``.capabilities.resources``,
@@ -1165,6 +1414,26 @@ class MCPServerTask:
     def _is_http(self) -> bool:
         """Check if this server uses HTTP transport."""
         return "url" in self._config
+
+    def _advertises_tools(self) -> bool:
+        """Whether the server advertises the ``tools`` capability.
+
+        Per the MCP spec, ``InitializeResult.capabilities.tools`` is non-None
+        iff the server implements the ``tools/*`` request family. Prompt-only
+        or resource-only servers omit it, and calling ``tools/list`` against
+        them raises ``McpError(-32601 Method not found)`` — which previously
+        killed the connection during discovery and made every keepalive fail.
+        (Ported from anomalyco/opencode#31271.)
+
+        Returns True when no capability info was captured (legacy fallback:
+        preserve the old always-call-list_tools behavior rather than regress
+        any server that was working before this gate).
+        """
+        init_result = self.initialize_result
+        caps = getattr(init_result, "capabilities", None) if init_result is not None else None
+        if caps is None:
+            return True
+        return getattr(caps, "tools", None) is not None
 
     # ----- Dynamic tool discovery (notifications/tools/list_changed) -----
 
@@ -1236,6 +1505,12 @@ class MCPServerTask:
         — atomic from the event loop's perspective.
         """
         from tools.registry import registry
+
+        if not self._advertises_tools():
+            # A server that doesn't implement tools/* should never send
+            # tools/list_changed, but guard anyway — calling tools/list
+            # would raise McpError(-32601).
+            return
 
         async with self._refresh_lock:
             # Capture old tool names for change diff
@@ -1324,12 +1599,22 @@ class MCPServerTask:
 
                 # Timeout — no lifecycle event fired.  Send a keepalive
                 # to exercise the connection and detect stale sockets.
+                # Prompt-only / resource-only servers don't implement
+                # ``tools/list`` (McpError -32601), so use the universal
+                # ``ping`` request for them instead — otherwise every
+                # keepalive cycle would trigger a spurious reconnect.
                 if self.session:
                     try:
-                        await asyncio.wait_for(
-                            self.session.list_tools(),
-                            timeout=30.0,
-                        )
+                        if self._advertises_tools():
+                            await asyncio.wait_for(
+                                self.session.list_tools(),
+                                timeout=30.0,
+                            )
+                        else:
+                            await asyncio.wait_for(
+                                self.session.send_ping(),
+                                timeout=30.0,
+                            )
                     except Exception as exc:
                         logger.warning(
                             "MCP server '%s' keepalive failed, "
@@ -1390,6 +1675,8 @@ class MCPServerTask:
         )
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
+        if self._elicitation:
+            sampling_kwargs.update(self._elicitation.session_kwargs())
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
 
@@ -1591,6 +1878,8 @@ class MCPServerTask:
                 raise
 
         sampling_kwargs = self._sampling.session_kwargs() if self._sampling else {}
+        if self._elicitation:
+            sampling_kwargs.update(self._elicitation.session_kwargs())
         if _MCP_NOTIFICATION_TYPES and _MCP_MESSAGE_HANDLER_SUPPORTED:
             sampling_kwargs["message_handler"] = self._make_message_handler()
 
@@ -1742,8 +2031,24 @@ class MCPServerTask:
                         )
 
     async def _discover_tools(self):
-        """Discover tools from the connected session."""
+        """Discover tools from the connected session.
+
+        Capability-gated: prompt-only / resource-only MCP servers don't
+        implement ``tools/list``, and calling it raises ``McpError(-32601)``,
+        which previously aborted the connection — those servers could never
+        stay connected for their prompts/resources. Skip the call when the
+        server doesn't advertise the ``tools`` capability.
+        (Ported from anomalyco/opencode#31271.)
+        """
         if self.session is None:
+            return
+        if not self._advertises_tools():
+            logger.info(
+                "MCP server '%s': does not advertise 'tools' capability — "
+                "skipping tools/list (prompts/resources remain available)",
+                self.name,
+            )
+            self._tools = []
             return
         async with self._rpc_lock:
             tools_result = await self.session.list_tools()
@@ -1769,6 +2074,16 @@ class MCPServerTask:
             self._sampling = SamplingHandler(self.name, sampling_config)
         else:
             self._sampling = None
+
+        # Set up elicitation handler if enabled and SDK types are available.
+        # Servers use elicitation/create to ask the client for structured
+        # input mid-tool-call (e.g. payment authorization). The handler
+        # routes those requests through Hermes' approval system.
+        elicitation_config = config.get("elicitation", {})
+        if elicitation_config.get("enabled", True) and _MCP_ELICITATION_TYPES:
+            self._elicitation = ElicitationHandler(self.name, elicitation_config, owner=self)
+        else:
+            self._elicitation = None
 
         # Validate: warn if both url and command are present
         if "url" in config and "command" in config:
@@ -1800,7 +2115,12 @@ class MCPServerTask:
             # before surfacing an opaque CancelledError. Probing here — once,
             # outside the SDK task group — fails fast and non-retryably with
             # an actionable message, mirroring the URL-validation path above.
-            if config.get("transport") != "sse":
+            # Skip the probe when _ready is already set: that only happens
+            # after a prior successful connect, so this run() invocation is a
+            # reconnect (OAuth recovery / manual refresh). The endpoint was
+            # already validated once; re-probing burns a redundant network
+            # round-trip against a known-good server on every reconnect.
+            if config.get("transport") != "sse" and not self._ready.is_set():
                 try:
                     _probe_headers = dict(config.get("headers") or {})
                     await self._preflight_content_type(
@@ -1981,6 +2301,8 @@ class MCPServerTask:
 # ---------------------------------------------------------------------------
 
 _servers: Dict[str, MCPServerTask] = {}
+_server_connecting: set[str] = set()
+_server_connect_errors: Dict[str, str] = {}
 
 # Circuit breaker: consecutive error counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
@@ -2367,8 +2689,8 @@ _mcp_tool_server_names: Dict[str, str] = {}
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
-# Protects _mcp_loop, _mcp_thread, _servers, _parallel_safe_servers,
-# _mcp_tool_server_names, and _stdio_pids.
+# Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
+# _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
 _lock = threading.Lock()
 
 # PIDs of stdio MCP server subprocesses.  Tracked so we can force-kill
@@ -2455,6 +2777,37 @@ def _ensure_mcp_loop():
         _mcp_thread.start()
 
 
+def _wrap_with_home_override(coro: "Coroutine") -> "Coroutine":
+    """Carry the caller's context-local HERMES_HOME override into ``coro``.
+
+    Returns ``coro`` unchanged when no override is active. Otherwise wraps
+    it so the override is set inside the coroutine's own (task-local)
+    context on the MCP loop and reset when it completes — concurrent calls
+    carrying different scopes don't interfere.
+    """
+    try:
+        from hermes_constants import (
+            get_hermes_home_override,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        home_override = get_hermes_home_override()
+    except Exception:
+        return coro
+    if not home_override:
+        return coro
+
+    async def _scoped():
+        token = set_hermes_home_override(home_override)
+        try:
+            return await coro
+        finally:
+            reset_hermes_home_override(token)
+
+    return _scoped()
+
+
 def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
 
@@ -2477,6 +2830,19 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
         raise RuntimeError("MCP event loop is not running")
 
     coro = coro_or_factory() if callable(coro_or_factory) else coro_or_factory
+
+    # Propagate the context-local HERMES_HOME override onto the MCP loop.
+    # Tasks scheduled via run_coroutine_threadsafe are created INSIDE the
+    # loop thread, so they copy the loop thread's context — not the
+    # scheduling thread's. A per-request profile scope (the dashboard's
+    # ?profile= endpoints, e.g. the MCP "Test server" probe) would silently
+    # vanish here: OAuth token stores and any other get_hermes_home()
+    # resolution inside the coroutine would read the process home instead
+    # of the selected profile's. Re-establish the override inside the
+    # task's own context (task-local — concurrent calls carrying different
+    # scopes don't interfere). No-op when no override is active.
+    coro = _wrap_with_home_override(coro)
+
     future = safe_schedule_threadsafe(
         coro, loop,
         logger=logger,
@@ -2522,16 +2888,52 @@ def _interrupted_call_result() -> str:
 # ---------------------------------------------------------------------------
 
 def _interpolate_env_vars(value):
-    """Recursively resolve ``${VAR}`` placeholders from ``os.environ``."""
+    """Recursively resolve ``${VAR}`` placeholders.
+
+    Resolves from the active profile's secret scope when multiplexing is on
+    (so an MCP server config's ``${API_KEY}`` picks up the routed profile's
+    value, not the process-global ``os.environ`` which may hold another
+    profile's), falling back to ``os.environ`` otherwise. Unset vars keep the
+    literal ``${VAR}`` placeholder, as before.
+    """
+    from agent.secret_scope import get_secret as _get_secret
+
     if isinstance(value, str):
         def _replace(m):
-            return os.environ.get(m.group(1), m.group(0))
+            return _get_secret(m.group(1), m.group(0)) or m.group(0)
         return _ENV_VAR_PATTERN.sub(_replace, value)
     if isinstance(value, dict):
         return {k: _interpolate_env_vars(v) for k, v in value.items()}
     if isinstance(value, list):
         return [_interpolate_env_vars(v) for v in value]
     return value
+
+
+def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
+    """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
+    try:
+        from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
+    except Exception:
+        _validate_mcp_server_entry: Callable[[str, dict[str, Any]], list[str]] | None = None
+
+    if _validate_mcp_server_entry is None:
+        return servers
+
+    safe_servers = {}
+    for name, cfg in servers.items():
+        if not isinstance(cfg, dict):
+            safe_servers[name] = cfg
+            continue
+        issues = _validate_mcp_server_entry(name, cfg)
+        if issues:
+            logger.warning(
+                "Skipping suspicious MCP server '%s': %s",
+                name,
+                "; ".join(issues),
+            )
+            continue
+        safe_servers[name] = cfg
+    return safe_servers
 
 
 def _load_mcp_config() -> Dict[str, dict]:
@@ -2547,6 +2949,11 @@ def _load_mcp_config() -> Dict[str, dict]:
     """
     try:
         from hermes_cli.config import load_config
+        # Safe mode (--safe-mode / HERMES_SAFE_MODE=1): troubleshooting run
+        # with all customizations disabled — no MCP servers connect.
+        from utils import env_var_enabled as _env_enabled
+        if _env_enabled("HERMES_SAFE_MODE"):
+            return {}
         config = load_config()
         servers = config.get("mcp_servers")
         if not servers or not isinstance(servers, dict):
@@ -2557,7 +2964,12 @@ def _load_mcp_config() -> Dict[str, dict]:
             load_hermes_dotenv()
         except Exception:
             pass
-        return {name: _interpolate_env_vars(cfg) for name, cfg in servers.items()}
+        safe_servers: Dict[str, dict] = {}
+        for name, cfg in _filter_suspicious_mcp_servers(servers).items():
+            interpolated = _interpolate_env_vars(cfg)
+            if isinstance(interpolated, dict):
+                safe_servers[name] = interpolated
+        return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -2631,7 +3043,15 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         async def _call():
             async with server._rpc_lock:
-                result = await server.session.call_tool(tool_name, arguments=args)
+                # Snapshot the agent's context so an elicitation callback
+                # triggered during this call (fired on the MCP recv loop
+                # task, which doesn't inherit our contextvars) can replay
+                # it and detect the gateway platform / session for routing.
+                server._pending_call_context = contextvars.copy_context()
+                try:
+                    result = await server.session.call_tool(tool_name, arguments=args)
+                finally:
+                    server._pending_call_context = None
             # MCP CallToolResult has .content (list of content blocks) and .isError
             if result.isError:
                 error_text = ""
@@ -3468,6 +3888,8 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         timeout=connect_timeout,
     )
     with _lock:
+        _server_connecting.discard(name)
+        _server_connect_errors.pop(name, None)
         _servers[name] = server
 
     registered_names = _register_server_tools(name, server, config)
@@ -3502,6 +3924,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
 
+    servers = _filter_suspicious_mcp_servers(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []
@@ -3514,6 +3937,9 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             for k, v in servers.items()
             if k not in _servers and _parse_boolish(v.get("enabled", True), default=True)
         }
+        _server_connecting.update(new_servers)
+        for srv_name in new_servers:
+            _server_connect_errors.pop(srv_name, None)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
@@ -3541,12 +3967,20 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         for name, result in zip(server_names, results):
             if isinstance(result, BaseException):
                 command = new_servers.get(name, {}).get("command")
+                message = _format_connect_error(result)
+                with _lock:
+                    _server_connecting.discard(name)
+                    _server_connect_errors[name] = message
                 logger.warning(
                     "Failed to connect to MCP server '%s'%s: %s",
                     name,
                     f" (command={command})" if command else "",
-                    _format_connect_error(result),
+                    message,
                 )
+            else:
+                with _lock:
+                    _server_connecting.discard(name)
+                    _server_connect_errors.pop(name, None)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
@@ -3651,8 +4085,10 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
 def get_mcp_status() -> List[dict]:
     """Return status of all configured MCP servers for banner display.
 
-    Returns a list of dicts with keys: name, transport, tools, connected.
-    Includes both successfully connected servers and configured-but-failed ones.
+    Returns a list of dicts with keys: name, transport, tools, connected,
+    disabled, and status. Includes connected servers, disabled servers,
+    in-flight connection attempts, recorded failures, and servers that are
+    configured but have not been started in this process yet.
     """
     result: List[dict] = []
 
@@ -3663,6 +4099,8 @@ def get_mcp_status() -> List[dict]:
 
     with _lock:
         active_servers = dict(_servers)
+        connecting = set(_server_connecting)
+        connect_errors = dict(_server_connect_errors)
 
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
@@ -3675,11 +4113,12 @@ def get_mcp_status() -> List[dict]:
                 "tools": len(server._registered_tool_names) if hasattr(server, "_registered_tool_names") else len(server._tools),
                 "connected": True,
                 "disabled": False,
+                "status": "connected",
             }
             if server._sampling:
                 entry["sampling"] = dict(server._sampling.metrics)
             result.append(entry)
-        else:
+        elif not enabled:
             # A server with enabled: false is intentionally not connected — it is
             # disabled, not failed. Surface that distinction so consumers (banner,
             # TUI) can render "disabled" rather than an alarming "failed".
@@ -3688,7 +4127,36 @@ def get_mcp_status() -> List[dict]:
                 "transport": transport,
                 "tools": 0,
                 "connected": False,
-                "disabled": not enabled,
+                "disabled": True,
+                "status": "disabled",
+            })
+        elif name in connecting:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": False,
+                "status": "connecting",
+            })
+        elif name in connect_errors:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": False,
+                "status": "failed",
+                "error": connect_errors[name],
+            })
+        else:
+            result.append({
+                "name": name,
+                "transport": transport,
+                "tools": 0,
+                "connected": False,
+                "disabled": False,
+                "status": "configured",
             })
 
     return result
@@ -3755,7 +4223,7 @@ def probe_mcp_server_tools() -> Dict[str, List[tuple]]:
     except Exception as exc:
         logger.debug("MCP probe failed: %s", exc)
     finally:
-        _stop_mcp_loop()
+        _stop_mcp_loop_if_idle()
 
     return result
 
@@ -3800,7 +4268,7 @@ def shutdown_mcp_servers():
         if future is not None:
             try:
                 future.result(timeout=15)
-            except Exception as exc:
+            except BaseException as exc:
                 logger.debug("Error during MCP shutdown: %s", exc)
 
     _stop_mcp_loop()
@@ -3893,10 +4361,25 @@ def _kill_orphaned_mcp_children(include_active: bool = False) -> None:
         )
 
 
-def _stop_mcp_loop():
+def _stop_mcp_loop_if_idle() -> bool:
+    """Stop the MCP loop only when no registered server still owns it.
+
+    Probe paths create temporary MCPServerTask instances that are not placed in
+    ``_servers``.  They should clean up an otherwise-idle loop, but must not
+    tear down the process-global loop when live agent tools are registered on
+    it.  Otherwise a dashboard/CLI probe can make later MCP tool calls fail
+    with ``MCP event loop is not running``.
+    """
+    return _stop_mcp_loop(only_if_idle=True)
+
+
+def _stop_mcp_loop(*, only_if_idle: bool = False) -> bool:
     """Stop the background event loop and join its thread."""
     global _mcp_loop, _mcp_thread
     with _lock:
+        if only_if_idle and (_servers or _server_connecting):
+            logger.debug("Leaving MCP event loop running; active servers are registered or connecting")
+            return False
         loop = _mcp_loop
         thread = _mcp_thread
         _mcp_loop = None
@@ -3913,3 +4396,4 @@ def _stop_mcp_loop():
         # graceful shutdown are now orphaned — include active PIDs too
         # since the loop is gone and no session can still be in flight.
         _kill_orphaned_mcp_children(include_active=True)
+    return True
