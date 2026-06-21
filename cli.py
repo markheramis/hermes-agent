@@ -1031,11 +1031,20 @@ def _run_cleanup(*, notify_session_finalize: bool = True):
             # partially-initialised agents where the attribute is missing.
             _session_msgs = getattr(_active_agent_ref, '_session_messages', None)
             if isinstance(_session_msgs, list):
+                logger.info(
+                    "CLI cleanup calling memory shutdown for session %s with %d message(s)",
+                    getattr(_active_agent_ref, "session_id", None) or "<unknown>",
+                    len(_session_msgs),
+                )
                 _active_agent_ref.shutdown_memory_provider(_session_msgs)
             else:
+                logger.info(
+                    "CLI cleanup calling memory shutdown for session %s without session message list",
+                    getattr(_active_agent_ref, "session_id", None) or "<unknown>",
+                )
                 _active_agent_ref.shutdown_memory_provider()
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("CLI cleanup memory shutdown failed: %s", e, exc_info=True)
 
 
 def _should_emit_cleanup_session_finalize(session_id: str | None) -> bool:
@@ -6927,6 +6936,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             _cprint(f"  ✗ {result.error_message}")
             return
 
+        if self.agent is not None:
+            try:
+                from hermes_cli.context_switch_guard import merge_preflight_compression_warning
+
+                merge_preflight_compression_warning(
+                    result,
+                    agent=self.agent,
+                    messages=list(self.conversation_history or []),
+                    config_context_length=getattr(self.agent, "_config_context_length", None),
+                )
+            except Exception as exc:
+                logger.debug("preflight-compression switch warning failed: %s", exc)
+
         old_model = self.model
         self.model = result.new_model
         self.provider = result.target_provider
@@ -7192,6 +7214,19 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         if not result.success:
             _cprint(f"  ✗ {result.error_message}")
             return
+
+        if self.agent is not None:
+            try:
+                from hermes_cli.context_switch_guard import merge_preflight_compression_warning
+
+                merge_preflight_compression_warning(
+                    result,
+                    agent=self.agent,
+                    messages=list(self.conversation_history or []),
+                    config_context_length=getattr(self.agent, "_config_context_length", None),
+                )
+            except Exception as exc:
+                logger.debug("preflight-compression switch warning failed: %s", exc)
 
         if not self._confirm_expensive_model_switch(result):
             _cprint("  Model switch cancelled.")
@@ -9661,16 +9696,35 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             else:
                 print(f"  🔧 {len(new_tools)} tool(s) available from {len(connected_servers)} server(s)")
 
-            # Refresh the agent's tool list so the model can call new tools
+            # Refresh the agent's tool list so the model can call new tools.
+            # Route through the shared helper so this CLI /reload-mcp path stays
+            # in lockstep with the TUI RPC / gateway reload / late-binding paths
+            # (name-diff, thread-safe, and — critically — additive-preserving so
+            # memory-provider and context-engine tools survive the rebuild).
             if self.agent is not None:
-                self.agent.tools = get_tool_definitions(
-                    enabled_toolsets=self.agent.enabled_toolsets
-                    if hasattr(self.agent, "enabled_toolsets") else None,
+                from tools.mcp_tool import refresh_agent_mcp_tools
+                # Explicit reload: pick up MCP servers the user ENABLED in config
+                # this session. self.enabled_toolsets was resolved once at
+                # startup; merge in any now-connected server names (unless the
+                # user pinned `all`/`*`, which already includes everything) so a
+                # freshly-added server isn't filtered out. Mirrors startup, where
+                # MCP server names are part of enabled_toolsets (see __init__).
+                enabled_override = None
+                et = self.enabled_toolsets
+                if et and "all" not in et and "*" not in et:
+                    merged = list(et)
+                    for _name in sorted(connected_servers):
+                        if _name not in merged:
+                            merged.append(_name)
+                    enabled_override = merged
+                refresh_agent_mcp_tools(
+                    self.agent,
+                    enabled_override=enabled_override,
                     quiet_mode=True,
                 )
-                self.agent.valid_tool_names = {
-                    tool["function"]["name"] for tool in self.agent.tools
-                } if self.agent.tools else set()
+                # Keep the CLI's own list in sync with what the agent now uses.
+                if enabled_override is not None:
+                    self.enabled_toolsets = enabled_override
 
             # Inject a message at the END of conversation history so the
             # model knows tools changed.  Appended after all existing
@@ -11495,6 +11549,36 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             os.system("cls" if os.name == "nt" else "clear")
         except Exception:
             pass
+
+    def _persist_active_session_before_close(self):
+        """Best-effort SQLite/JSON flush before the CLI marks a session closed.
+
+        ``run_conversation()`` normally persists at turn boundaries, but a
+        terminal close/SIGHUP/SIGTERM can unwind the prompt_toolkit app while
+        the agent thread still holds the current turn only in memory.  Flush the
+        agent's live ``_session_messages`` before ``end_session()`` so resume,
+        session_search, and state.db do not lose the interrupted turn.
+        """
+        agent = getattr(self, "agent", None)
+        if not agent or not hasattr(agent, "_persist_session"):
+            return
+
+        messages = getattr(agent, "_session_messages", None)
+        if not isinstance(messages, list):
+            messages = getattr(self, "conversation_history", None)
+        if not isinstance(messages, list) or not messages:
+            return
+
+        conversation_history = getattr(self, "conversation_history", None)
+        if not isinstance(conversation_history, list):
+            conversation_history = messages
+
+        try:
+            agent._persist_session(messages, conversation_history)
+            if getattr(agent, "session_id", None):
+                self.session_id = agent.session_id
+        except (Exception, KeyboardInterrupt) as e:
+            logger.debug("Could not persist active CLI session before close: %s", e)
 
     def _print_exit_summary(self):
         """Print session resume info on exit, similar to Claude Code."""
@@ -14192,6 +14276,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             set_sudo_password_callback(None)
             set_approval_callback(None)
             set_secret_capture_callback(None)
+            # Flush any in-memory turn transcript before marking the session
+            # closed.  On SIGHUP/SIGTERM/window close the agent thread may not
+            # reach its normal run_conversation() persistence path before the
+            # daemon thread is reaped.
+            self._persist_active_session_before_close()
+
             # Close session in SQLite
             if hasattr(self, '_session_db') and self._session_db and self.agent:
                 try:
